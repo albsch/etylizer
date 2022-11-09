@@ -452,3 +452,72 @@ foo2(b) -> 2.
     (a|b) -> 1|true.
 foo3(a) -> 1;
 foo3(b) -> true.
+
+-spec divergent_tuple() -> none().
+divergent_tuple() ->
+    {0,1,throw(42)}.
+
+-spec divergent_tuple2() -> {integer(), integer(), integer()}.
+divergent_tuple2() ->
+    {0,1,throw(42)}.
+
+-spec loop() -> none().
+loop() ->
+    % do some side-effects
+    _A = 2,
+    loop().
+
+% no_return() is alias for none()
+-spec loop2() -> no_return().
+loop2() ->
+    loop2().
+
+% should behave same way as tuples
+-spec divergent_list() -> none().
+divergent_list() ->
+    [0,1,throw(42)].
+
+-spec divergent_list2() -> [integer()].
+divergent_list2() ->
+    [0,1,throw(42)].
+
+% should behave same way as tuples and lists
+% if any member of the sequence diverges,
+% the whole sequence diverges (== none())
+-spec divergent_sequence() -> none().
+divergent_sequence() ->
+    1,
+    throw(42),
+    ok.
+
+-spec divergent_begin() -> none().
+divergent_begin() ->
+    begin
+        1,
+        throw(42),
+        ok
+    end,
+    ok.
+
+% unrelated output is ok for diverging functions
+% none() function body output is always subtype
+% of any output spec
+-spec divergent_unrelated() -> [integer()].
+divergent_unrelated() ->
+    1,
+    throw(42),
+    {42, 42}.
+
+% Questions
+%  * do we treat no returns the same way as intended looping?
+%  * i.e. no return error == intended looping
+%  * or none() == no_return()
+%  * dialyzer treats none() differently from no_return()
+%  * dialyzer complains that all these functions have no local return
+
+
+-spec match_in_sequence() -> integer().
+match_in_sequence() ->
+    X = 2,
+    X = "hello",
+    3.
