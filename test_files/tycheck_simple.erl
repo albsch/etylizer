@@ -463,8 +463,6 @@ divergent_tuple2() ->
 
 -spec loop() -> none().
 loop() ->
-    % do some side-effects
-    _A = 2,
     loop().
 
 % no_return() is alias for none()
@@ -490,6 +488,14 @@ divergent_sequence() ->
     throw(42),
     ok.
 
+-spec divergent_case_fail(any()) -> none().
+divergent_case_fail(X) ->
+    case X of
+        1 -> 42;
+        _ -> throw(42)
+    end,
+    42.
+
 -spec divergent_begin() -> none().
 divergent_begin() ->
     begin
@@ -508,16 +514,3 @@ divergent_unrelated() ->
     throw(42),
     {42, 42}.
 
-% Questions
-%  * do we treat no returns the same way as intended looping?
-%  * i.e. no return error == intended looping
-%  * or none() == no_return()
-%  * dialyzer treats none() differently from no_return()
-%  * dialyzer complains that all these functions have no local return
-
-
--spec match_in_sequence() -> integer().
-match_in_sequence() ->
-    X = 2,
-    X = "hello",
-    3.
