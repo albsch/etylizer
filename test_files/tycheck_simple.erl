@@ -452,3 +452,22 @@ foo2(b) -> 2.
     (a|b) -> 1|true.
 foo3(a) -> 1;
 foo3(b) -> true.
+
+
+-spec match_in_sequence_fail(string()) -> integer().
+match_in_sequence_fail(Y) ->
+    X = 2, % X :: 2
+    X = Y, % X :: string() ! fail
+    3.
+
+-spec match_in_sequence_superset(integer()) -> integer().
+match_in_sequence_superset(Y) ->
+    X = 2, % X :: 2
+    X = Y, % X :: integer() && 2 not empty
+    3.
+
+-spec match_in_sequence_exact(2) -> integer().
+match_in_sequence_exact(Y) ->
+    X = 2, % X :: 2
+    X = Y, % X :: 2 && 2 not empty
+    3.
