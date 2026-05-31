@@ -8,7 +8,12 @@
     % under a tag that cannot collide with the descriptor keys above.
     {phi_tuple_memo, [ty_node:type()], [ty_tuple:type()]} => boolean()
 }.
--type normalize_cache() :: #{{ty_node:type(), monomorphic_variables()} => constraint_set:set_of_constraint_sets()}.
+-type normalize_cache() :: #{
+    {ty_node:type(), monomorphic_variables()} => constraint_set:set_of_constraint_sets(),
+    % dnf_ty_tuple:phi_norm/4 keeps its sub-problem memo in the same threaded
+    % map, under a tag that cannot collide with the node keys above.
+    {phi_norm_tuple_memo, [ty_node:type()], [ty_tuple:type()]} => constraint_set:set_of_constraint_sets()
+}.
 -type all_variables_cache() :: #{ty_node:type() => _}.
 -type unparse_cache() :: #{ty_node:type() => ast_ty()}.
 
