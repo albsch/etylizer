@@ -103,10 +103,25 @@ normalize_line({Pos, Neg, T}, Fixed, ST) ->
   BigS = ty_tuple:big_intersect(Pos),
   phi_norm(ty_tuple:components(BigS), Neg, Fixed, ST).
 
--spec phi_norm([ty_node:type()], [T], monomorphic_variables(), S) -> 
+-spec phi_norm([ty_node:type()], [T], monomorphic_variables(), S) ->
     {set_of_constraint_sets(), S} when S :: normalize_cache(), T :: ?ATOM:type().
-phi_norm(BigS, [], Fixed, ST) ->
-  ?METRIC_SUBPROBLEM(norm, tuple),
+phi_norm(BigS, NegList, Fixed, ST) ->
+  % The recursion in phi_norm_solve/5 reaches the same (BigS, NegList) pair over
+  % and over within a single normalize run, so memoize on it. Fixed does not
+  % vary during a traversal, and the memo rides in the threaded cache map, which
+  % is discarded when normalize returns -- it never outlives the call.
+  Key = {phi_norm_tuple_memo, BigS, NegList},
+  case ST of
+    #{Key := Cached} -> {Cached, ST};
+    _ ->
+      ?METRIC_SUBPROBLEM(norm, tuple),
+      {Res, ST1} = phi_norm_impl(BigS, NegList, Fixed, ST),
+      {Res, ST1#{Key => Res}}
+  end.
+
+-spec phi_norm_impl([ty_node:type()], [T], monomorphic_variables(), S) ->
+    {set_of_constraint_sets(), S} when S :: normalize_cache(), T :: ?ATOM:type().
+phi_norm_impl(BigS, [], Fixed, ST) ->
   lists:foldl( % FIXME shortcut
     fun(S, {Res, ST0}) -> 
       {R, ST1} = ty_node:normalize(S, Fixed, ST0),
@@ -114,8 +129,7 @@ phi_norm(BigS, [], Fixed, ST) ->
     end, 
     {[], ST}, 
     BigS);
-phi_norm(BigS, [Ty | N], Fixed, ST) ->
-  ?METRIC_SUBPROBLEM(norm, tuple),
+phi_norm_impl(BigS, [Ty | N], Fixed, ST) ->
   {R1, ST0} = lists:foldl(
     fun(_S, {[[]], ST2}) -> {[[]], ST2};
        (S, {R2, ST2}) ->
