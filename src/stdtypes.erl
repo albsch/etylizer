@@ -325,9 +325,16 @@ builtin_ops() ->
     DivOpTy = tyscm(tinter([tfun([tint(), tint()], tint()), tfun([tnon_neg_int(), tnon_neg_int()], tnon_neg_int())])),
     IntOpTy = tyscm(tinter([tfun([tnon_neg_int(), tnon_neg_int()], tnon_neg_int()), tfun([tint(), tint()], tint())])),
     BoolOpTy = tyscm(tfun([tbool(), tbool()], tbool())),
-    AndShortcutOpTy = tyscm(tinter([tfun([tatom(false), tany()], tatom(false)), tfun([tatom(true), tvar(a)], tvar(a))])),
-    OrShortcutOpTy = tyscm(tinter([tfun([tatom(true), tany()], tatom(true)), tfun([tatom(false), tvar(b)], tvar(b))])),
-    PolyOpTy = tyscm(tfun([tvar(aa), tvar(aa)], tbool())),
+    % These schemes are polymorphic: the type variable `a` must be quantified so that
+    % it is renamed to a fresh variable at every use site (see constr_simp:fresh_ty_scheme,
+    % which only freshens variables listed in the scheme's binder). Building them with
+    % tyscm/1 (an empty binder) leaks `a` as a single shared variable across all
+    % applications, so two uses of the same operator — or of two operators sharing the
+    % name — get conflated into one unsatisfiable constraint set (issue #235). Because
+    % each scheme now binds its own `a`, they can all reuse the same name safely.
+    AndShortcutOpTy = tyscm([a], tinter([tfun([tatom(false), tany()], tatom(false)), tfun([tatom(true), tvar(a)], tvar(a))])),
+    OrShortcutOpTy = tyscm([a], tinter([tfun([tatom(true), tany()], tatom(true)), tfun([tatom(false), tvar(a)], tvar(a))])),
+    PolyOpTy = tyscm([a], tfun([tvar(a), tvar(a)], tbool())),
     [
         {'+', 2, NumOpTy},
         {'-', 2, NumOpTy},
