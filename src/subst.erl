@@ -205,11 +205,12 @@ apply(S, T, _) -> apply_base(S, T).
 apply_base(S, T) ->
     case T of
         {singleton, _} -> T;
-        % TODO full bitstring support
         {bitstring} -> T;
-        % {binary, _, _} -> T;
+        {bitstring, _, _} -> T;
         {empty_list} -> T;
+        {empty_bitstring} -> T;
         {cons, A, B} -> {cons, apply_base(S, A), apply_base(S, B)};
+        {bitstring_cons, A, B} -> {bitstring_cons, apply_base(S, A), apply_base(S, B)};
         {list, U} -> {list, apply_base(S, U)};
         {mu, V, U} -> {mu, V, apply_base(S, U)};
         {nonempty_list, U} -> {nonempty_list, apply_base(S, U)};
@@ -420,7 +421,9 @@ collect_vars({singleton, _}, _CPos, Pos, _, _) -> Pos;
 collect_vars({range, _, _}, _CPos, Pos, _, _) -> Pos;
 collect_vars({_, any}, _CPos, Pos, _, _) -> Pos;
 collect_vars({empty_list}, _CPos, Pos, _, _) -> Pos;
+collect_vars({empty_bitstring}, _CPos, Pos, _, _) -> Pos;
 collect_vars({bitstring}, _CPos, Pos, _, _) -> Pos;
+collect_vars({bitstring, _, _}, _CPos, Pos, _, _) -> Pos;
 collect_vars({map_any}, _CPos, Pos, _, _) -> Pos;
 collect_vars({tuple_any}, _CPos, Pos, _, _) -> Pos;
 collect_vars({fun_simple}, _CPos, Pos, _, _) -> Pos;
@@ -435,6 +438,8 @@ collect_vars({list, A}, CPos, Pos, Fix, VCache) ->
 collect_vars({mu, _MuVar, A}, CPos, Pos, Fix, VCache) -> % skip recursion variables
     collect_vars(A, CPos, Pos, Fix, VCache);
 collect_vars({cons, A, B}, CPos, Pos, Fix, VCache) ->
+    collect_vars(B, CPos, collect_vars(A, CPos, Pos, Fix, VCache), Fix, VCache);
+collect_vars({bitstring_cons, A, B}, CPos, Pos, Fix, VCache) ->
     collect_vars(B, CPos, collect_vars(A, CPos, Pos, Fix, VCache), Fix, VCache);
 collect_vars({improper_list, A, B}, CPos, Pos, Fix, VCache) ->
     collect_vars(B, CPos, collect_vars(A, CPos, Pos, Fix, VCache), Fix, VCache);
