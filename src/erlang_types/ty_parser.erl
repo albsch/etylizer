@@ -36,7 +36,12 @@
 -define(UNPARSE_NAMED_QUEUE, ty_parser_unparse_queue).
 -define(UNPARSE_NAMED_FINISHED, ty_parser_unparse_finish).
 
--define(ALL_ETS, [?CACHE, ?SYMTAB, ?TERMREFS, ?UNIFY, ?UNPARSE_CACHE, ?UNPARSE_NAMED_QUEUE, ?UNPARSE_NAMED_FINISHED, ?UNPARSE_NAMED_MAPPING]).
+% set of nominal type keys (from symtab)
+-define(NOMINALS, ty_parser_nominals).
+% derivation map: {NomKey1, NomKey2} means NomKey1's body contains NomKey2
+-define(NOMINAL_DERIVES, ty_parser_nominal_derives).
+
+-define(ALL_ETS, [?CACHE, ?SYMTAB, ?TERMREFS, ?UNIFY, ?UNPARSE_CACHE, ?UNPARSE_NAMED_QUEUE, ?UNPARSE_NAMED_FINISHED, ?UNPARSE_NAMED_MAPPING, ?NOMINALS, ?NOMINAL_DERIVES]).
 
 -define(TY, dnf_ty_variable).
 -define(NODE, ty_node).
@@ -67,6 +72,7 @@
     | ast:ty_union() | ast:ty_intersection() | ast:ty_negation().
 -type ast_ty_compound() :: ast:ty_cons() | ast:ty_list() | ast:ty_nonempty_list()
     | ast:ty_improper_list() | ast:ty_nonempty_improper_list()
+    | ast:ty_bitstring() | ast:ty_bitstring_cons() | ast:ty_empty_bitstring()
     | ast:ty_full_fun() | ast:ty_map() | ast:ty_tuple()
     | ast:ty_var() | ast:ty_union() | ast:ty_intersection() | ast:ty_negation().
 -type ast_ty_rewrite() :: ast:ty_cons() | ast:ty_list() | ast:ty_nonempty_list()
@@ -98,11 +104,13 @@
 -type ast_ty_db4() :: ast:ty_tuple_any() | ast:ty_tuple() | ast:ty_var()
     | ast:ty_union() | ast:ty_intersection() | ast:ty_negation().
 % Subset types for convert_back helpers
--type ast_ty_cb_other() :: ast:ty_singleton() | ast:ty_bitstring() | ast:ty_some_list()
+-type ast_ty_cb_other() :: ast:ty_singleton() | ast:ty_bitstring() | ast:ty_bitstring_cons()
+    | ast:ty_empty_bitstring() | ast:ty_some_list()
     | ast:ty_fun() | ast:ty_integer_range() | ast:ty_map_any() | ast:ty_map()
     | ast:ty_predef() | ast:ty_predef_alias() | ast:ty_named()
     | ast:ty_tuple_any() | ast:ty_negation().
 -type ast_ty_cb_rest() :: ast:ty_singleton() | ast:ty_bitstring() | ast:ty_empty_list()
+    | ast:ty_empty_bitstring()
     | ast:ty_fun() | ast:ty_integer_range() | ast:ty_map_any() | ast:ty_map()
     | ast:ty_predef() | ast:ty_predef_alias() | ast:ty_named()
     | ast:ty_tuple_any() | ast:ty_negation().
@@ -128,7 +136,61 @@ clean() ->
 set_symtab(SymTab) ->
   Types = symtab:get_types(SymTab),
   % elp:ignore W0034
-  [ty_parser:extend_symtab(K, V) || {K, V} <- maps:to_list(Types)].
+  [ty_parser:extend_symtab(K, V) || {K, V} <- maps:to_list(Types)],
+  % Store nominal type keys for wrapping during parsing
+  Nominals = symtab:get_nominals(SymTab),
+  ets:delete_all_objects(?NOMINALS),
+  NomList = sets:to_list(Nominals),
+  lists:foreach(fun(Key) -> ets:insert(?NOMINALS, {Key}) end, NomList),
+  % Build and store derivation map for nominal types
+  ets:delete_all_objects(?NOMINAL_DERIVES),
+  build_and_store_derivation_map(SymTab, NomList).
+
+-spec build_and_store_derivation_map(symtab:t(), [symtab:ty_key()]) -> ok.
+build_and_store_derivation_map(Tab, NomKeys) ->
+  lists:foreach(fun({ty_key, M, N, A} = Key) ->
+    Ref = {ty_ref, M, N, A},
+    Derives = find_derived_nominals(Tab, Key, Ref, sets:new()),
+    lists:foreach(fun(DerivedKey) ->
+      ets:insert(?NOMINAL_DERIVES, {{Key, DerivedKey}})
+    end, sets:to_list(Derives))
+  end, NomKeys),
+  ok.
+
+-spec find_derived_nominals(symtab:t(), symtab:ty_key(), ast:ty_ref(), sets:set(symtab:ty_key())) -> sets:set(symtab:ty_key()).
+find_derived_nominals(Tab, Key, Ref, Visited) ->
+  case sets:is_element(Key, Visited) of
+    true -> sets:new();
+    false ->
+      {ty_scheme, Vars, Body} = symtab:lookup_ty(Ref, ast:loc_auto(), Tab),
+      VarNames = [V || {V, _Bound} <- Vars],
+      Args = [{predef, any} || _ <- VarNames],
+      SubstBody = case length(VarNames) =:= length(Args) andalso Args =/= [] of
+        true ->
+          Map = subst:from_list(lists:zip(VarNames, Args)),
+          subst:apply(Map, Body, no_clean);
+        false -> Body
+      end,
+      Visited1 = sets:add_element(Key, Visited),
+      DirectNominals = collect_nominal_refs(Tab, SubstBody),
+      sets:fold(fun(DerivedKey, Acc) ->
+        {ty_key, DM, DN, DA} = DerivedKey,
+        Transitive = find_derived_nominals(Tab, DerivedKey, {ty_ref, DM, DN, DA}, Visited1),
+        sets:union(sets:add_element(DerivedKey, Transitive), Acc)
+      end, DirectNominals, DirectNominals)
+  end.
+
+-spec collect_nominal_refs(symtab:t(), ast:ty()) -> sets:set(symtab:ty_key()).
+collect_nominal_refs(Tab, Ty) ->
+  Refs = utils:everything(
+    fun ({named, _, Ref, _}) ->
+      case symtab:is_nominal(Ref, Tab) of
+        true -> {ok, symtab:ref_to_key(Ref)};
+        false -> error
+      end;
+      (_) -> error
+    end, Ty),
+  sets:from_list(Refs).
 
 -spec parse(ast_ty()) -> type().
 parse(RawTy) ->
@@ -415,6 +477,28 @@ new_local_ref(RawTerm) ->
     _ -> Reff
   end.
 
+-spec nominal_derives_from(ty_nominal:nominal_key(), ty_nominal:nominal_key()) -> boolean().
+nominal_derives_from({M1, N1, A1}, {M2, N2, A2}) ->
+  ets:member(?NOMINAL_DERIVES, {{ty_key, M1, N1, A1}, {ty_key, M2, N2, A2}}).
+
+% Wrap each leaf of a dnf_ty_variable BDD with a nominal tag at the dnf_ty_nominal level.
+-spec wrap_nominal_tag(ty_nominal:type(), dnf_ty_variable:type()) -> dnf_ty_variable:type().
+wrap_nominal_tag(NomTag, {leaf, NomBdd}) ->
+  {leaf, dnf_ty_nominal:nominal(NomTag, NomBdd)};
+wrap_nominal_tag(NomTag, {node, Var, Pos, Neg}) ->
+  {node, Var, wrap_nominal_tag(NomTag, Pos), wrap_nominal_tag(NomTag, Neg)}.
+
+-spec is_nominal_ref(ety_ref()) -> boolean().
+is_nominal_ref({ty_ref, M, N, A}) ->
+  ets:member(?NOMINALS, {ty_key, M, N, A});
+is_nominal_ref({ty_qref, M, N, A}) ->
+  ets:member(?NOMINALS, {ty_key, M, N, A});
+is_nominal_ref(_) -> false.
+
+-spec ref_to_nominal_key(ety_ref()) -> ty_nominal:nominal_key().
+ref_to_nominal_key({ty_ref, M, N, A}) -> {M, N, A};
+ref_to_nominal_key({ty_qref, M, N, A}) -> {M, N, A}.
+
 -spec extend_symtab(ast:ty_ref(), ety_ty_scheme()) -> _.
 extend_symtab({_, Namespace, Type, ArgsCount}, RawTyScheme) ->
   Ref = {Namespace, Type, ArgsCount},
@@ -486,7 +570,14 @@ do_convert_named_new(X, Ref, Args, R, Q, Cache) ->
   case ets:lookup(?CACHE, NewRef) of
     [] ->
       % create a new reference (ref args pair), memoize, and add continue converting
-      {InternalTy, NewQ, {R0, R1}, C0} = do_convert({NewTy, R}, Q, Cache#{{Ref, Args} => NewRef}),
+      {InternalTy0, NewQ, {R0, R1}, C0} = do_convert({NewTy, R}, Q, Cache#{{Ref, Args} => NewRef}),
+      % If the type is nominal, wrap with a nominal tag at the dnf_ty_nominal level
+      InternalTy = case is_nominal_ref(Ref) of
+        true ->
+          NomTag = ty_nominal:new(ref_to_nominal_key(Ref)),
+          wrap_nominal_tag(NomTag, InternalTy0);
+        false -> InternalTy0
+      end,
       {InternalTy, NewQ, {R0#{NewRef => InternalTy}, group(R1, InternalTy, NewRef)}, C0};
     [{NewRef, CachedNode}] ->
       % reuse type representation of the global cache
@@ -550,7 +641,25 @@ do_convert_builtin({fun_simple}, R, Q, Cache) -> {?TY:functions(ty_functions:any
 do_convert_builtin({tuple_any}, R, Q, Cache) -> {?TY:tuples(ty_tuples:any()), Q, R, Cache};
 do_convert_builtin({empty_list}, R, Q, Cache) -> {?TY:predefined(dnf_ty_predefined:predefined('[]')), Q, R, Cache};
 do_convert_builtin({map_any}, R, Q, Cache) -> {?TY:map(dnf_ty_map:any()), Q, R, Cache};
-do_convert_builtin({bitstring}, R, Q, Cache) -> {?TY:bitstring(dnf_ty_bitstring:any()), Q, R, Cache};
+% bitstrings: rewrite to 1-bit cons cells + empty_bitstring predefined
+% bitstring() = mu X. empty_bitstring | <<0..1 | X>>
+do_convert_builtin({bitstring}, R, Q, Cache) ->
+  do_convert_builtin({bitstring, 0, 1}, R, Q, Cache);
+do_convert_builtin({bitstring, 0, 0}, R, Q, Cache) ->
+  do_convert({{empty_bitstring}, R}, Q, Cache);
+do_convert_builtin({bitstring, M, 0}, R, Q, Cache) when M > 0 ->
+  % Exactly M bits: M cons cells ending in empty_bitstring
+  Term = bits_cons(M, {empty_bitstring}),
+  do_convert({Term, R}, Q, Cache);
+do_convert_builtin({bitstring, M, N}, R, Q, Cache) when N > 0 ->
+  % M + K*N bits: M head bits + recursive tail of N-bit groups
+  RVar = {mu_var, list_to_atom(integer_to_list(erlang:unique_integer()))},
+  Tail = {mu, RVar, {union, [{empty_bitstring}, bits_cons(N, RVar)]}},
+  Term = bits_cons(M, Tail),
+  do_convert({Term, R}, Q, Cache);
+% empty bitstring <<>>
+do_convert_builtin({empty_bitstring}, R, Q, Cache) ->
+  {?TY:predefined(dnf_ty_predefined:predefined(empty_bitstring)), Q, R, Cache};
 do_convert_builtin(Ty, R, Q, Cache) ->
   do_convert_literal(Ty, R, Q, Cache).
 
@@ -663,6 +772,11 @@ do_convert_data({cons, A, B}, R, Q, Cache) ->
 
   {?TY:list(dnf_ty_list:singleton(ty_list:list([T1, T2]))), Q1, R, Cache};
 
+do_convert_data({bitstring_cons, A, B}, R, Q, Cache) ->
+  {T1, Q0} = queue_if_new(A, Q),
+  {T2, Q1} = queue_if_new(B, Q0),
+  {?TY:bitstring(dnf_ty_bitstring:singleton(ty_bitstring:bitstring_cons([T1, T2]))), Q1, R, Cache};
+
 do_convert_data(T, _R, _Q, _Cache) ->
   convert_error(T).
 
@@ -677,6 +791,14 @@ queue_all(Elements, Q) ->
       {IdOrNode, QQ} = queue_if_new(Element, OldQ),
       {Components ++ [IdOrNode], QQ}
     end, {[], Q}, Elements).
+
+% Build N nested bitstring_cons cells with {range, 0, 1} heads (1-bit cons cells).
+% bits_cons(0, Tail) = Tail
+% bits_cons(3, Tail) = <<0..1 | <<0..1 | <<0..1 | Tail>>>>
+-spec bits_cons(non_neg_integer(), ast_ty()) -> ast_ty().
+bits_cons(0, Tail) -> Tail;
+bits_cons(N, Tail) when N > 0 ->
+  {bitstring_cons, {range, 0, 1}, bits_cons(N - 1, Tail)}.
 
 -spec queue_if_new(ast_ty(), queue()) -> {type() | temporary_ref(), queue()}.
 queue_if_new(Element, Queue) ->
@@ -752,6 +874,9 @@ debruijn({mu_var, Name}, Env) ->
 % other cases
 debruijn({singleton, _} = T, _Env) -> T;
 debruijn({bitstring}, _Env) -> {bitstring};
+debruijn({bitstring, M, N}, _Env) -> {bitstring, M, N};
+debruijn({empty_bitstring}, _Env) -> {empty_bitstring};
+debruijn({bitstring_cons, H, T}, Env) -> {bitstring_cons, debruijn(H, Env), debruijn(T, Env)};
 debruijn({empty_list}, _Env) -> {empty_list};
 debruijn({cons, U, L}, Env) -> {cons, debruijn(U, Env), debruijn(L, Env)};
 debruijn({list, U}, Env) -> {list, debruijn(U, Env)};
@@ -853,6 +978,10 @@ convert_back_other({cons, Arg, Arg2}, Env, Counter) ->
   {ConvertedArg, NewCounter} = convert_back(Arg, Env, Counter),
   {ConvertedArg2, NewCounter2} = convert_back(Arg2, Env, NewCounter),
   {{cons, ConvertedArg, ConvertedArg2}, NewCounter2};
+convert_back_other({bitstring_cons, Arg, Arg2}, Env, Counter) ->
+  {ConvertedArg, NewCounter} = convert_back(Arg, Env, Counter),
+  {ConvertedArg2, NewCounter2} = convert_back(Arg2, Env, NewCounter),
+  {{bitstring_cons, ConvertedArg, ConvertedArg2}, NewCounter2};
 convert_back_other({improper_list, Arg, Arg2}, Env, Counter) ->
   {ConvertedArg, NewCounter} = convert_back(Arg, Env, Counter),
   {ConvertedArg2, NewCounter2} = convert_back(Arg2, Env, NewCounter),
