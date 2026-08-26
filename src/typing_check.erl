@@ -2,7 +2,8 @@
 
 -export([
     check_all/4,
-    check_all_report/4
+    check_all_report/4,
+    check_all_collect/4
 ]).
 
 -ifdef(TEST).
@@ -18,15 +19,16 @@
 -include("metrics.hrl").
 
 % Checks all functions against their specs, only print a report.
+% Returns the list of functions that failed type checking.
 -spec check_all_report(
         ctx(), string(), symtab:fun_env(), [{ast:fun_decl(), ast:ty_scheme()}]
-       ) -> ok.
+       ) -> [{atom(), arity()}].
 check_all_report(Ctx, FileName, Env, Decls) ->
     ?LOG_NOTE("Checking ~w functions in ~s against their specs", length(Decls), FileName),
     ExtSymtab = symtab:extend_symtab_with_fun_env(Env, Ctx#ctx.symtab),
     ExtCtx = Ctx#ctx { symtab = ExtSymtab },
     F = fun(FN) -> filename:basename(filename:rootname(FN)) end,
-    lists:foreach(
+    lists:filtermap(
         fun({Decl, Ty}) ->
             {function, _, Name, Arity, _} = Decl,
             ?METRIC_SET_FUN(list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity]))),
@@ -35,31 +37,36 @@ check_all_report(Ctx, FileName, Env, Decls) ->
                 success ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, ok}),
-                    io:format(user,"Ok: ~s:~w/~w (~p ms)~n", [F(FileName), Name, Arity, Time]);
+                    io:format(user,"Ok: ~s:~w/~w (~p ms)~n", [F(FileName), Name, Arity, Time]),
+                    false;
                 timeout ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, timeout}),
-                    io:format(user,"Timeout: ~s:~w/~w (~p ms)~n", [F(FileName), Name, Arity, Time])
+                    io:format(user,"Timeout: ~s:~w/~w (~p ms)~n", [F(FileName), Name, Arity, Time]),
+                    {true, {Name, Arity}}
             catch
                 throw:{etylizer, ty_error, Msg} ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, error}),
-                    io:format(user,"Error: ~s:~w/~w (~p ms)~n  ~s~n", [F(FileName), Name, Arity, Time, Msg]);
+                    io:format(user,"Error: ~s:~w/~w (~p ms)~n  ~s~n", [F(FileName), Name, Arity, Time, Msg]),
+                    {true, {Name, Arity}};
                 throw:{etylizer, unsupported, Msg} ->
-                    io:format(user,"Unsupported: ~s:~w/~w~n  ~s~n", [F(FileName), Name, Arity, Msg]);
+                    io:format(user,"Unsupported: ~s:~w/~w~n  ~s~n", [F(FileName), Name, Arity, Msg]),
+                    {true, {Name, Arity}};
                 throw:{etylizer, Type, _Msg} ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, error}),
-                    io:format(user,"Error: (~p) ~s:~w/~w (~p ms)~n", [Type, F(FileName), Name, Arity, Time]);
+                    io:format(user,"Error: (~p) ~s:~w/~w (~p ms)~n", [Type, F(FileName), Name, Arity, Time]),
+                    {true, {Name, Arity}};
                 _:T ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, error}),
-                    io:format(user,"Other: (~p) ~s:~w/~w (~p ms)~n", [{T}, F(FileName), Name, Arity, Time])
+                    io:format(user,"Other: (~p) ~s:~w/~w (~p ms)~n", [{T}, F(FileName), Name, Arity, Time]),
+                    {true, {Name, Arity}}
             end
         end,
         Decls
-    ),
-    ok.
+    ).
 
 % Checks a function against its spec, skips timeouts and does not report errors.
 -spec check_report(ctx(), ast:fun_decl(), ast:ty_scheme()) -> success | timeout.
@@ -124,6 +131,36 @@ check_all(Ctx, FileName, Env, Decls) ->
             ?LOG_NOTE("Checking failed: ~s", Msg),
             {error, Msg}
     end.
+
+% Checks all functions against their specs, collecting all diagnostics as data instead of
+% throwing on the first error. Mirrors check_all_report/4's per-function try/catch, but
+% accumulates diagnostics:diagnostic() values rather than printing them. Continues to the
+% next function after an error, so all functions are reported (first located error per
+% function). The structured location is currently the function declaration location; the
+% precise per-expression location is embedded in the message text.
+-spec check_all_collect(
+        ctx(), string(), symtab:fun_env(), [{ast:fun_decl(), ast:ty_scheme()}]
+       ) -> [diagnostics:diagnostic()].
+check_all_collect(Ctx, FileName, Env, Decls) ->
+    ?LOG_INFO("Collecting diagnostics for ~w functions in ~s", length(Decls), FileName),
+    ExtSymtab = symtab:extend_symtab_with_fun_env(Env, Ctx#ctx.symtab),
+    ExtCtx = Ctx#ctx { symtab = ExtSymtab },
+    lists:foldr(
+        fun({Decl, Ty}, Acc) ->
+            {function, Loc, Name, Arity, _} = Decl,
+            try check(ExtCtx, Decl, Ty) of
+                ok -> Acc
+            catch
+                throw:{etylizer, Kind, Msg} ->
+                    % Prefer the precise location embedded in the message; fall back to
+                    % the function declaration location.
+                    PreciseLoc = diagnostics:loc_from_message(Msg, Loc),
+                    [diagnostics:from_error(Kind, PreciseLoc, Msg, Name, Arity) | Acc]
+            end
+        end,
+        [],
+        Decls
+    ).
 
 % Ensures that a mono type used as a spec is supported. Throws a ty_error if not.
 -spec ensure_type_supported(ast:loc(), ast:ty()) -> _.
@@ -204,7 +241,8 @@ check_alt(Ctx, Decl = {function, Loc, Name, Arity, _}, FunTy, BranchMode, Fixed)
                FunStr, pretty:render_ty(FunTy)),
     DisableExhaustiveness = sets:is_element({Name, Arity}, Ctx#ctx.disable_exhaustiveness),
     DisableRedundancy = sets:is_element({Name, Arity}, Ctx#ctx.disable_redundancy),
-    Cs = constr_gen:gen_constrs_annotated_fun(Ctx#ctx.exhaustiveness_mode, Ctx#ctx.symtab, {DisableExhaustiveness, DisableRedundancy}, FunTy, Decl),
+    RecvMsgTyArg = maps:get({Name, Arity}, Ctx#ctx.recv_msg_tys, none),
+    Cs = constr_gen:gen_constrs_annotated_fun(Ctx#ctx.exhaustiveness_mode, Ctx#ctx.symtab, {DisableExhaustiveness, DisableRedundancy}, RecvMsgTyArg, FunTy, Decl),
     case Ctx#ctx.sanity of
         {ok, TyMap} -> constr_gen:sanity_check(Cs, TyMap);
         error -> ok
@@ -295,7 +333,7 @@ sublocation_map(Term) ->
     Entries = utils:everything(
       fun({'case', Loc, Expr, Clauses}) -> {rec, {Loc, [Expr, Clauses]}};
          ({'fun', Loc, _, Clauses}) -> {rec, {Loc, Clauses}};
-         ({case_clause, Loc, Pat, _Guards, Body}) -> {rec, {Loc, [Pat, Body]}};
+         ({case_clause, Loc, Pat, _Guards, Body, _Gen}) -> {rec, {Loc, [Pat, Body]}};
          ({fun_clause, Loc, Pats, _Guards, Body}) -> {rec, {Loc, [Pats, Body]}};
          (_) -> error
       end, Term),
@@ -309,7 +347,7 @@ collect_locs(Term, Cache) ->
       fun({loc, _, _, _} = Loc) -> {ok, Loc};
          ({'case', Loc, _, _}) -> cached(Loc, Cache);
          ({'fun', Loc, _, _}) -> cached(Loc, Cache);
-         ({case_clause, Loc, _, _, _}) -> cached(Loc, Cache);
+         ({case_clause, Loc, _, _, _, _}) -> cached(Loc, Cache);
          ({fun_clause, Loc, _, _, _}) -> cached(Loc, Cache);
          (_) -> error
       end, Term)).
