@@ -17,7 +17,7 @@
 -include("sanity.hrl").
 -include("constraints.hrl").
 
--define(TALLY_DEFAULT(), is_satisfiable_v4).
+-define(TALLY_DEFAULT(), is_satisfiable_v5).
 
 -type normalized_set_of_constraint_sets() :: set_of_constraint_sets(). % normalized set of constraint sets
 -type solutions() :: set_of_constraint_sets(). % saturated set of constraint sets
@@ -35,6 +35,7 @@ is_tally_satisfiable(Constraints, MonomorphicVariables) ->
     "v2" -> is_satisfiable_v2(Constraints, MonomorphicVariables);
     "v3" -> is_satisfiable_v3(Constraints, MonomorphicVariables);
     "v4" -> is_satisfiable_v4(Constraints, MonomorphicVariables);
+    "v5" -> is_satisfiable_v5(Constraints, MonomorphicVariables);
     _ -> ?TALLY_DEFAULT()(Constraints, MonomorphicVariables)
   end.
 
@@ -205,6 +206,96 @@ do_find(S, {Cr, CurrentResult}, Acc, MonoVars) ->
 %     {shortcut, Z} -> Z;
 %     Z -> Z
 %   end.
+
+% same slicing as v4, but the merge picks its next constraint by disjunction
+% width instead of by trial-merging every candidate
+-spec is_satisfiable_v5(input_constraints(), monomorphic_variables()) -> boolean().
+is_satisfiable_v5(Constraints, MonomorphicVariables) ->
+  % First, normalize and saturate each constraint individually
+  InputSolutions = [tally_saturate(tally_normalize([C], MonomorphicVariables), MonomorphicVariables) || C <- Constraints],
+
+  case lists:all(fun([[]]) -> true; (_) -> false end, InputSolutions) of
+    true -> true;
+    false ->
+      Red = [N || N <- InputSolutions, N /= [[]]],
+      merge_narrowest_first(order_narrow_first(Red), [[]], MonomorphicVariables)
+  end.
+
+%% Merging the per-constraint solutions is a fold, and which solution to fold in
+%% next is a free choice. It decides two things at once: how wide the
+%% accumulator gets, and how early a contradiction surfaces. v4 chooses by
+%% trial-merging each remaining candidate and keeping whichever widens the
+%% accumulator least -- a choice paid for in the type engine, and one that
+%% optimises only for width. It never aims at a contradiction, so an
+%% unsatisfiable query can build the whole product before reaching the
+%% constraints that decide it.
+%%
+%% v5 keeps the slicing and merges narrowest disjunction first. That is unit
+%% propagation: a width-1 solution is a deterministic consequence and merging it
+%% cannot widen the accumulator, so draining those first keeps the accumulator
+%% small *and* closes transitive variable bounds early, which is where
+%% contradictions live. The merge exits as soon as the accumulator empties and
+%% each step costs more the wider the accumulator is, so reaching the deciding
+%% constraints early does not save a fraction of the work -- it skips the
+%% expensive steps altogether.
+%%
+%% Ordering alone is not safe: it is greedy on a proxy it never checks, and a
+%% sequence that looks narrow at every step can still explode. So the ordered
+%% candidates are walked and the first that does not *widen* the accumulator is
+%% taken, falling back to the least widening one. The guard bounds the damage;
+%% the ordering is what makes the guarded walk stop after one or two candidates
+%% instead of trying them all.
+-spec merge_narrowest_first([solutions()], CurrentResult::solutions(),
+                            monomorphic_variables()) -> boolean().
+merge_narrowest_first([], _FinalResult, _MonoVars) ->
+  % No input solutions left to merge, finished; FinalResult can't be []
+  true;
+merge_narrowest_first(TodoSols, CurrentResult, MonoVars) ->
+  case walk_guarded(TodoSols, CurrentResult, constraint_set:len(CurrentResult), MonoVars, none) of
+    unsat -> false;
+    {NewResult, Selected} ->
+      merge_narrowest_first(TodoSols -- [Selected], NewResult, MonoVars)
+  end.
+
+%% Sorted once, never recomputed: a solution's width is fixed at normalization
+%% and the merge only removes entries, so re-sorting per step cannot change the
+%% order. (A tiebreak on variable overlap with the accumulator, which *would*
+%% change per step, was measured and made no difference -- the guard already
+%% covers what it was meant to.)
+-spec order_narrow_first([solutions()]) -> [solutions()].
+order_narrow_first(Sols) ->
+  lists:sort(fun(A, B) -> length(A) =< length(B) end, Sols).
+
+%% Take the first candidate that does not widen the accumulator. A candidate that
+%% empties it has answered the whole query, so the walk stops there.
+%%
+%% When widening is unavoidable -- which happens on satisfiable queries, where
+%% every constraint must be merged and the accumulator has to grow -- no
+%% candidate can satisfy the first test, so the walk would evaluate all of them
+%% and keep the least widening. That is the expensive way to make a choice: each
+%% trial is a full meet+saturate against a wide accumulator. Stop instead at the
+%% first candidate that improves on the best seen so far, which is enough to
+%% avoid a bad pick without pricing every alternative.
+-spec walk_guarded([solutions()], solutions(), non_neg_integer(),
+                   monomorphic_variables(), none | {solutions(), solutions()}) ->
+        unsat | {solutions(), solutions()}.
+walk_guarded([], _Acc, _AccLen, _MonoVars, none) -> unsat;
+walk_guarded([], _Acc, _AccLen, _MonoVars, Best) -> Best;
+walk_guarded([Sol | Rest], Acc, AccLen, MonoVars, Best) ->
+  New = tally_saturate(constraint_set:meet(Sol, Acc, MonoVars), MonoVars),
+  case constraint_set:len(New) of
+    0 -> unsat;
+    NewLen when NewLen =< AccLen -> {New, Sol};
+    NewLen ->
+      case Best of
+        none -> walk_guarded(Rest, Acc, AccLen, MonoVars, {New, Sol});
+        {BestSols, _} ->
+          case NewLen < constraint_set:len(BestSols) of
+            true -> {New, Sol};
+            false -> walk_guarded(Rest, Acc, AccLen, MonoVars, Best)
+          end
+      end
+  end.
 
 % =========================
 % full tally implementation
