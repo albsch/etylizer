@@ -55,6 +55,7 @@
 
 -include("erlang_types.hrl").
 -include("etylizer.hrl").
+-include("metrics.hrl").
 
 -type type() :: {node, integer()}.
 -type set_of_constraint_sets() :: constraint_set:set_of_constraint_sets().
@@ -167,10 +168,12 @@ leq(T1, T2, Cache) ->
 
 -spec is_empty(type()) -> boolean().
 is_empty(TyNode) ->
+  ?METRIC_ENGINE_CALL(),
   case ets:lookup(?CACHE, TyNode) of
     [{_, R}] -> ?assert_type(R, boolean());
     [_ | _] -> error(invariant);
     [] ->
+      ?METRIC_MISS(),
       {Result, LocalCache} = is_empty(TyNode, #{}),
       utils:update_ets_from_map(?CACHE, LocalCache),
       ets:insert(?CACHE, [{TyNode, Result}]),
@@ -288,10 +291,12 @@ dump_list(List) ->
 % TODO backtrack-free algorithm, see subtyping comment
 -spec normalize(type(), monomorphic_variables()) -> set_of_constraint_sets().
 normalize(TyNode, FixedVariables) ->
+  ?METRIC_ENGINE_CALL(),
   Z = case ets:lookup(?NORMCACHE, {TyNode, FixedVariables}) of
     [{_, Result}] -> ?assert_type(Result, set_of_constraint_sets());
     [_ | _] -> error(invariant);
     [] ->
+      ?METRIC_MISS(),
       {Result, _LocalCache} = normalize(TyNode, FixedVariables, #{}),
       ets:insert(?NORMCACHE, [{{TyNode, FixedVariables}, Result}]),
       Result
@@ -576,10 +581,12 @@ all_variables(Ty, Cache) ->
 %-spec opcache(term(), fun(() -> A)) -> A. % TODO scoped variables extension for annotations
 -spec opcache(term(), fun(() -> type())) -> type().
 opcache(Key, F) ->
+  ?METRIC_ENGINE_CALL(),
   case ets:lookup(?OPCACHE, Key) of
     [{_, Result}] -> ?assert_type(Result, type());
     [_ | _] -> error(invariant);
     [] ->
+      ?METRIC_MISS(),
       R = F(),
       ets:insert(?OPCACHE, [{Key, R}]),
       R

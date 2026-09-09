@@ -59,6 +59,43 @@ report(Title, Pr, Base) ->
                                     PrInfer, BaseInfer, HasBase);
         error -> ok
     end,
+    case maps:find(<<"typecheck_work">>, Pr) of
+        {ok, _} ->
+            PrWork0 = maps:get(<<"typecheck_work">>, Pr, []),
+            BaseWork0 = maps:get(<<"typecheck_work">>, Base, []),
+            PrWork1 = case HasBase of
+                true ->
+                    BaseFnSet2 = sets:union(function_set(BaseTimes),
+                                            work_label_set(BaseWork0)),
+                    [E || E = [N | _] <- PrWork0, sets:is_element(N, BaseFnSet2)];
+                false -> PrWork0
+            end,
+            %% A killed worker's span ends at a wall-clock-dependent point, so
+            %% functions truncated in either cell are dropped from both sides,
+            %% as the poly section does.
+            UnstableW = unstable_fns(PrTimes, BaseTimes, Pr, Base),
+            {PrWork, PrWDropped} = drop_unstable(PrWork1, UnstableW),
+            {BaseWork, BaseWDropped} = drop_unstable(BaseWork0, UnstableW),
+            print_work_section(section_title(Title, "Type Engine Work"),
+                               PrWork, BaseWork, HasBase),
+            print_work_exclusions(PrWDropped, BaseWDropped, HasBase);
+        error -> ok
+    end,
+    case maps:find(<<"tally_problem">>, Pr) of
+        {ok, _} ->
+            PrProb0 = maps:get(<<"tally_problem">>, Pr, []),
+            BaseProb = maps:get(<<"tally_problem">>, Base, []),
+            PrProb = case HasBase of
+                true ->
+                    BaseFnSet3 = sets:union(function_set(BaseTimes),
+                                            problem_fn_set(BaseProb)),
+                    [E || E = [N | _] <- PrProb0, sets:is_element(N, BaseFnSet3)];
+                false -> PrProb0
+            end,
+            print_problem_section(section_title(Title, "Tally Problems"),
+                                  PrProb, BaseProb, HasBase);
+        error -> ok
+    end,
     %% Verdict flips, reusing the cells already loaded above (no recomputation):
     %% on this fixed corpus, list functions whose Error/Ok verdict differs
     %% between the base engine and the PR engine.
@@ -365,16 +402,344 @@ print_poly_row(Metric, Vals) ->
     Fmt = "| ~s" ++ lists:flatten(lists:duplicate(length(All) - 1, " | ~s")) ++ " |~n",
     io:format(Fmt, All).
 
+%% An "engine call" is one call into the cached ty_node API
+%% A "miss" is the subset where the engine computed something instead of answering from cache. 
+
+work_label_set(Entries) ->
+    sets:from_list([Name || [Name | _] <- Entries]).
+
+work_stats([]) ->
+    #{functions => 0, engine_calls => 0, misses => 0, reductions => 0,
+      avg_calls => 0.0, max_calls => {0, <<>>},
+      avg_reductions => 0, max_reductions => {0, <<>>}};
+work_stats(Entries) ->
+    {T, M, R} = lists:foldl(
+        fun([_N, To, Mi, Re], {At, Am, Ar}) -> {At + To, Am + Mi, Ar + Re} end,
+        {0, 0, 0}, Entries),
+    N = length(Entries),
+    #{functions => N, engine_calls => T, misses => M, reductions => R,
+      avg_calls => T / max(1, N), max_calls => max_entry(2, Entries),
+      avg_reductions => R div max(1, N), max_reductions => max_entry(4, Entries)}.
+
+%% {Value, FnLabel} of the entry with the largest field Ix.
+max_entry(Ix, Entries) ->
+    lists:foldl(
+        fun(E = [N | _], {BV, _} = Acc) ->
+            V = lists:nth(Ix, E),
+            case V > BV of true -> {V, N}; false -> Acc end
+        end, {0, <<>>}, Entries).
+
+hit_rate(#{engine_calls := 0}) -> 0.0;
+hit_rate(#{engine_calls := T, misses := M}) -> 100.0 * (T - M) / T.
+
+print_work_section(Title, PrEntries, BaseEntries, HasBase) ->
+    io:format("## ~s~n~n", [Title]),
+    PrS = work_stats(PrEntries),
+    case HasBase of
+        true ->
+            BaseS = work_stats(BaseEntries),
+            io:format("| Metric | PR-common | Base | Delta |~n", []),
+            io:format("|--------|-----------|------|-------|~n", []),
+            row4_int("Functions", maps:get(functions, PrS), maps:get(functions, BaseS)),
+            row4_int("Engine calls", maps:get(engine_calls, PrS), maps:get(engine_calls, BaseS)),
+            row4_int("Misses", maps:get(misses, PrS), maps:get(misses, BaseS)),
+            row4_pct("Cache hit rate", hit_rate(PrS), hit_rate(BaseS)),
+            row4_f1("Engine calls per function", maps:get(avg_calls, PrS), maps:get(avg_calls, BaseS)),
+            {PrMaxC, PrMaxCN} = maps:get(max_calls, PrS),
+            {BaseMaxC, BaseMaxCN} = maps:get(max_calls, BaseS),
+            row4_named_int("Max engine calls", PrMaxC, PrMaxCN, BaseMaxC, BaseMaxCN),
+            row4_int("Reductions", maps:get(reductions, PrS), maps:get(reductions, BaseS)),
+            row4_int("Reductions per function", maps:get(avg_reductions, PrS), maps:get(avg_reductions, BaseS)),
+            {PrMaxR, PrMaxRN} = maps:get(max_reductions, PrS),
+            {BaseMaxR, BaseMaxRN} = maps:get(max_reductions, BaseS),
+            row4_named_int("Max reductions", PrMaxR, PrMaxRN, BaseMaxR, BaseMaxRN);
+        false ->
+            io:format("| Metric | Value |~n", []),
+            io:format("|--------|-------|~n", []),
+            row1("Functions", ival(maps:get(functions, PrS))),
+            row1("Engine calls", ival(maps:get(engine_calls, PrS))),
+            row1("Misses", ival(maps:get(misses, PrS))),
+            row1("Cache hit rate", fmt_pct(hit_rate(PrS))),
+            row1("Engine calls per function", fmt_f1(maps:get(avg_calls, PrS))),
+            {PrMaxC, PrMaxCN} = maps:get(max_calls, PrS),
+            row1("Max engine calls", fmt_int_name(PrMaxC, PrMaxCN)),
+            row1("Reductions", ival(maps:get(reductions, PrS))),
+            row1("Reductions per function", ival(maps:get(avg_reductions, PrS))),
+            {PrMaxR, PrMaxRN} = maps:get(max_reductions, PrS),
+            row1("Max reductions", fmt_int_name(PrMaxR, PrMaxRN))
+    end,
+    io:format("~n", []).
+
+%% Say what was left out, so the table is never silently partial.
+print_work_exclusions(PrDropped, BaseDropped, HasBase) ->
+    Counts =
+        case HasBase of
+            true -> io_lib:format("~w PR / ~w base", [PrDropped, BaseDropped]);
+            false -> io_lib:format("~w", [PrDropped])
+        end,
+    io:format("_Excludes ~ts function(s) truncated by a 4s timeout (per-function "
+              "or error-localization) in either cell; their counters stop at a "
+              "wall-clock-dependent point and are not comparable between cells._~n~n",
+              [Counts]).
+
+%% --- Tally problems ---
+%%
+%% One entry per tally partition that finished: [Fn, Key, Constraints, Answer,
+%% EngineCalls, Misses, Reductions]. Key hashes the partition's constraint list,
+%% so the same problem can be found in both cells and compared pairwise. The
+%% paired problems are the body: what both engines solved, at what cost, by
+%% problem size. The leftovers are the tail: what only one engine finished --
+%% which is where timeouts live -- counted rather than excluded. Leftovers on
+%% both sides of the same function are the same problems under a different
+%% hash (something engine-dependent leaked into the constraint list); they are
+%% reported as unpaired. A different answer to a paired problem is a bug in one
+%% of the engines.
+
+problem_fn_set(Entries) ->
+    sets:from_list([Fn || [Fn | _] <- Entries]).
+
+problem_fn([Fn | _]) -> Fn.
+problem_nc([_Fn, _Key, NC | _]) -> NC.
+problem_answer([_Fn, _Key, _NC, Answer | _]) -> Answer.
+problem_calls([_Fn, _Key, _NC, _Answer, Calls | _]) -> Calls.
+problem_misses([_Fn, _Key, _NC, _Answer, _Calls, Misses | _]) -> Misses.
+problem_reds([_Fn, _Key, _NC, _Answer, _Calls, _Misses, Reds | _]) -> Reds.
+
+problem_name(E) ->
+    iolist_to_binary(io_lib:format("~s, ~B constraints", [problem_fn(E), problem_nc(E)])).
+
+sum_by(F, Entries) -> lists:sum([F(E) || E <- Entries]).
+
+%% #{{Fn, Key} => [Entry]} in recording order.
+problem_index(Entries) ->
+    lists:foldr(
+        fun(E = [Fn, Key | _], Acc) ->
+            maps:update_with({Fn, Key}, fun(L) -> [E | L] end, [E], Acc)
+        end, #{}, Entries).
+
+%% Pair entries with the same {Fn, Key} by order of occurrence. Returns
+%% {Pairs, LeftoversPr, LeftoversBase}, the leftovers as #{Fn => [Entry]}.
+pair_problems(PrEntries, BaseEntries) ->
+    PrIx = problem_index(PrEntries),
+    BaseIx = problem_index(BaseEntries),
+    Keys = lists:usort(maps:keys(PrIx) ++ maps:keys(BaseIx)),
+    lists:foldl(
+        fun(K = {Fn, _}, {Pairs, LPr, LBase}) ->
+            Ps = maps:get(K, PrIx, []),
+            Bs = maps:get(K, BaseIx, []),
+            N = min(length(Ps), length(Bs)),
+            {P1, P2} = lists:split(N, Ps),
+            {B1, B2} = lists:split(N, Bs),
+            {lists:zip(P1, B1) ++ Pairs,
+             leftover_add(Fn, P2, LPr), leftover_add(Fn, B2, LBase)}
+        end, {[], #{}, #{}}, Keys).
+
+leftover_add(_Fn, [], Acc) -> Acc;
+leftover_add(Fn, Es, Acc) -> maps:update_with(Fn, fun(L) -> L ++ Es end, Es, Acc).
+
+%% Per function, leftovers present on both sides did not pair; the excess on
+%% one side is that side's tail. Returns {Unpaired, TailPr, TailBase}, the
+%% tails as #{Fn => [Entry]}.
+split_leftovers(LPr, LBase) ->
+    Fns = lists:usort(maps:keys(LPr) ++ maps:keys(LBase)),
+    lists:foldl(
+        fun(Fn, {Unpaired, TPr, TBase}) ->
+            Ps = maps:get(Fn, LPr, []),
+            Bs = maps:get(Fn, LBase, []),
+            N = min(length(Ps), length(Bs)),
+            {_, PTail} = lists:split(N, Ps),
+            {_, BTail} = lists:split(N, Bs),
+            {Unpaired + N, leftover_add(Fn, PTail, TPr), leftover_add(Fn, BTail, TBase)}
+        end, {0, #{}, #{}}, Fns).
+
+size_buckets() -> [{1, 1}, {2, 3}, {4, 9}, {10, 29}, {30, 99}, {100, infinity}].
+
+in_bucket(NC, {Lo, infinity}) -> NC >= Lo;
+in_bucket(NC, {Lo, Hi}) -> NC >= Lo andalso NC =< Hi.
+
+bucket_label({Lo, Lo}) -> integer_to_list(Lo);
+bucket_label({Lo, infinity}) -> integer_to_list(Lo) ++ "+";
+bucket_label({Lo, Hi}) -> integer_to_list(Lo) ++ "-" ++ integer_to_list(Hi).
+
+max_problem(Entries) ->
+    lists:foldl(
+        fun(E, {BV, _} = Acc) ->
+            case problem_reds(E) > BV of
+                true -> {problem_reds(E), problem_name(E)};
+                false -> Acc
+            end
+        end, {0, <<>>}, Entries).
+
+print_problem_section(Title, PrEntries, BaseEntries, HasBase) ->
+    io:format("## ~s~n~n", [Title]),
+    case HasBase of
+        true -> print_paired_problems(PrEntries, BaseEntries);
+        false -> print_single_problems(PrEntries)
+    end,
+    io:format("~n", []).
+
+print_single_problems(Entries) ->
+    io:format("| Metric | Value |~n", []),
+    io:format("|--------|-------|~n", []),
+    row1("Problems", ival(length(Entries))),
+    row1("Reductions", ival(sum_by(fun problem_reds/1, Entries))),
+    row1("Engine calls", ival(sum_by(fun problem_calls/1, Entries))),
+    row1("Misses", ival(sum_by(fun problem_misses/1, Entries))),
+    {MaxR, MaxN} = max_problem(Entries),
+    row1("Max reductions", fmt_int_name(MaxR, MaxN)),
+    io:format("~n| Constraints | Problems | Reductions |~n", []),
+    io:format("|---|---|---|~n", []),
+    lists:foreach(
+        fun(B) ->
+            case [E || E <- Entries, in_bucket(problem_nc(E), B)] of
+                [] -> ok;
+                Es -> io:format("| ~s | ~B | ~s |~n",
+                                [bucket_label(B), length(Es),
+                                 fmt_big(sum_by(fun problem_reds/1, Es))])
+            end
+        end, size_buckets()).
+
+print_paired_problems(PrEntries, BaseEntries) ->
+    {Pairs, LPr, LBase} = pair_problems(PrEntries, BaseEntries),
+    {Unpaired, TailPr, TailBase} = split_leftovers(LPr, LBase),
+    PrBody = [P || {P, _} <- Pairs],
+    BaseBody = [B || {_, B} <- Pairs],
+    io:format("| Body: problems solved by both engines | PR-common | Base | Delta |~n", []),
+    io:format("|--------|-----------|------|-------|~n", []),
+    row4_int("Problems", length(PrBody), length(BaseBody)),
+    row4_int("Reductions", sum_by(fun problem_reds/1, PrBody), sum_by(fun problem_reds/1, BaseBody)),
+    row4_int("Engine calls", sum_by(fun problem_calls/1, PrBody), sum_by(fun problem_calls/1, BaseBody)),
+    row4_int("Misses", sum_by(fun problem_misses/1, PrBody), sum_by(fun problem_misses/1, BaseBody)),
+    {PrMaxR, PrMaxN} = max_problem(PrBody),
+    {BaseMaxR, BaseMaxN} = max_problem(BaseBody),
+    row4_named_int("Max reductions", PrMaxR, PrMaxN, BaseMaxR, BaseMaxN),
+    io:format("~n| Constraints | Problems | Reductions PR | Reductions Base | PR/Base "
+              "| Typical problem PR/Base | >2x worse | >2x better |~n", []),
+    io:format("|---|---|---|---|---|---|---|---|~n", []),
+    lists:foreach(
+        fun(B) ->
+            case [Pair || Pair = {P, _} <- Pairs, in_bucket(problem_nc(P), B)] of
+                [] -> ok;
+                Sel -> bucket_row(bucket_label(B), Sel)
+            end
+        end, size_buckets()),
+    io:format("~n", []),
+    print_flipped_answers(Pairs),
+    print_tail("PR", TailPr),
+    print_tail("base", TailBase),
+    print_movers(Pairs),
+    io:format("~n_~B problem(s) did not pair: same function, different constraint hash. "
+              "They are in neither the body nor the tail._~n", [Unpaired]).
+
+%% Typical = geometric mean of the per-problem ratio, so one huge problem
+%% cannot hide what happened to the thousands of small ones (or the reverse).
+bucket_row(Label, Pairs) ->
+    N = length(Pairs),
+    PrR = lists:sum([problem_reds(P) || {P, _} <- Pairs]),
+    BaseR = lists:sum([problem_reds(B) || {_, B} <- Pairs]),
+    Logs = [math:log((problem_reds(P) + 1) / (problem_reds(B) + 1)) || {P, B} <- Pairs],
+    Geo = math:exp(lists:sum(Logs) / N),
+    Two = math:log(2),
+    Worse = length([x || L <- Logs, L > Two]),
+    Better = length([x || L <- Logs, L < -Two]),
+    io:format("| ~s | ~B | ~s | ~s | ~s | ~s | ~s | ~s |~n",
+              [Label, N, fmt_big(PrR), fmt_big(BaseR), fmt_ratio(PrR, BaseR),
+               fmt_f2(Geo), fmt_share(Worse, N), fmt_share(Better, N)]).
+
+print_flipped_answers(Pairs) ->
+    Flips = [{problem_fn(P), problem_nc(P)}
+             || {P, B} <- Pairs, problem_answer(P) =/= problem_answer(B)],
+    case Flips of
+        [] -> io:format("- Answers: identical on every paired problem.~n", []);
+        _ ->
+            Shown = [io_lib:format("`~s` (~B constraints)", [Fn, NC])
+                     || {Fn, NC} <- lists:sublist(Flips, 5)],
+            io:format("- **Answers differ on ~B paired problem(s)**, a bug in one engine: ~s~n",
+                      [length(Flips), lists:join(", ", Shown)])
+    end.
+
+print_tail(Side, Tail) when map_size(Tail) =:= 0 ->
+    io:format("- Only ~s finished: none.~n", [Side]);
+print_tail(Side, Tail) ->
+    ByFn = lists:reverse(lists:keysort(2,
+        [{Fn, length(Es), sum_by(fun problem_reds/1, Es)} || {Fn, Es} <- maps:to_list(Tail)])),
+    Total = lists:sum([N || {_, N, _} <- ByFn]),
+    Reds = lists:sum([R || {_, _, R} <- ByFn]),
+    Shown = [io_lib:format("`~s` ~B", [Fn, N]) || {Fn, N, _} <- lists:sublist(ByFn, 5)],
+    io:format("- Only ~s finished: ~B problem(s) in ~B function(s), ~s reductions "
+              "spent on them: ~s~n",
+              [Side, Total, length(ByFn), fmt_big(Reds), lists:join(", ", Shown)]).
+
+print_movers(Pairs) ->
+    Sorted = lists:sort(
+        fun({P1, B1}, {P2, B2}) ->
+            problem_reds(P1) - problem_reds(B1) =< problem_reds(P2) - problem_reds(B2)
+        end, Pairs),
+    Wins = [Pair || Pair = {P, B} <- lists:sublist(Sorted, 3),
+                    problem_reds(P) < problem_reds(B)],
+    Regs = [Pair || Pair = {P, B} <- lists:sublist(lists:reverse(Sorted), 3),
+                    problem_reds(P) > problem_reds(B)],
+    io:format("- Largest regressions (reductions base -> PR): ~s~n", [movers(Regs)]),
+    io:format("- Largest wins: ~s~n", [movers(Wins)]).
+
+movers([]) -> "none";
+movers(Pairs) ->
+    lists:join("; ", [io_lib:format("`~s` (~B constraints) ~s -> ~s",
+                                    [problem_fn(P), problem_nc(P),
+                                     fmt_big(problem_reds(B)), fmt_big(problem_reds(P))])
+                      || {P, B} <- Pairs]).
+
+fmt_big(N) when N >= 1000000000 -> io_lib:format("~.2fG", [N / 1000000000]);
+fmt_big(N) when N >= 1000000 -> io_lib:format("~.1fM", [N / 1000000]);
+fmt_big(N) when N >= 1000 -> io_lib:format("~.1fk", [N / 1000]);
+fmt_big(N) -> integer_to_list(N).
+
+fmt_f2(F) -> io_lib:format("~.2f", [F]).
+
+fmt_ratio(_, 0) -> "n/a";
+fmt_ratio(P, B) -> io_lib:format("~.2f", [P / B]).
+
+fmt_share(_, 0) -> "0%";
+fmt_share(K, N) -> io_lib:format("~B%", [round(100 * K / N)]).
+
 %% --- Table row helpers ---
 
 row1(Metric, Val) ->
     io:format("| ~s | ~s |~n", [Metric, Val]).
+
+row4_pct(Metric, Com, Base) ->
+    io:format("| ~s | ~s | ~s | ~s |~n",
+              [Metric, fmt_pct(Com), fmt_pct(Base), delta_pct(Com, Base)]).
+
+row4_f1(Metric, Com, Base) ->
+    io:format("| ~s | ~s | ~s | ~s |~n",
+              [Metric, fmt_f1(Com), fmt_f1(Base), delta_f1(Com, Base)]).
+
+row4_named_int(Metric, ComV, ComN, BaseV, BaseN) ->
+    io:format("| ~s | ~s | ~s | ~s |~n",
+              [Metric, fmt_int_name(ComV, ComN), fmt_int_name(BaseV, BaseN),
+               delta_int(ComV, BaseV)]).
 
 %% --- Formatting ---
 
 ival(N) -> integer_to_list(N).
 
 fmt_f1(F) -> io_lib:format("~.1f", [F]).
+
+fmt_pct(F) -> io_lib:format("~.3f%", [F]).
+
+delta_pct(Pr, Base) ->
+    D = Pr - Base,
+    case abs(D) < 0.0005 of
+        true -> "0";
+        false when D > 0 -> io_lib:format("+~.3f%", [D]);
+        false -> io_lib:format("~.3f%", [D])
+    end.
+
+fmt_int_name(V, Name) when is_binary(Name), byte_size(Name) > 0 ->
+    io_lib:format("~B (`~s`)", [V, Name]);
+fmt_int_name(V, _) ->
+    io_lib:format("~B", [V]).
 
 fmt_time(Ms) when Ms >= 60000 ->
     Min = Ms div 60000,

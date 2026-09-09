@@ -59,6 +59,8 @@ set -e
     -l error \
     --type-overlay overlays/etylizer_overlay.erl \
     --no-deps \
+    -i 'metrics:bump/1' \
+    -i 'metrics:read_counters/0' \
     -i 'ty_parser:convert/3' \
     -i 'ty_parser:parse/1' \
     -i 'ty_parser:unify/2' \
