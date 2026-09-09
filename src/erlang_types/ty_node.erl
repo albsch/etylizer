@@ -589,6 +589,17 @@ collect_node_refs(Body) ->
     fun(E = {node, Id}) when is_integer(Id) -> {ok, E}; (_) -> error end,
     Body).
 
+%% all_variables/2 threads its visited set *down* the recursion but never across
+%% siblings, and keeps no memo, so a node reachable by k paths is expanded k
+%% times: the cost is exponential in the depth of the node DAG rather than
+%% linear in its size. On the shared unions produced by large symbol tables a
+%% single call does not return in any practical time.
+%%
+%% Walk the DAG here instead, with a real visited set, so every node is expanded
+%% exactly once. A node's own layer is read by handing all_variables/2 a cache
+%% pre-seeded with that node's children: the seed stops the descent exactly at
+%% the children, which this walk then visits itself. Results are memoized in
+%% ETS as well, since substitute/2 asks for them per node.
 -spec all_variables(type()) -> sets:set(variable()).
 all_variables(Ty) ->
   case ets:lookup(?VARCACHE, Ty) of
