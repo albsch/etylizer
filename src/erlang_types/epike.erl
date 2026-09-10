@@ -247,11 +247,11 @@ decide([G | Gs], S, K, Tr, Path, D, Acc, Reads, Env) ->
 %% set, hands its reads on when it exits, and if it fails before it ever
 %% exited, {T, reads} is learned.
 -spec empty(ty:type(), s(), k(), trail(), reason(), env()) -> boolean().
-empty(T, S = #s{c = C, x = X, reads = Reads0, store = Store0}, K, Tr, Path, Env) ->
+empty(T, S = #s{c = C, x = X, reads = Reads0, store = Store0}, K, Tr, Path, Env = #env{fixed = Fixed}) ->
   case X of
     #{{node, T} := _} -> ret(S, K, Tr, Env);
     _ ->
-      Lines = dnf_ty_variable:minimize_dnf(ty_node:load(T)),
+      Lines = ground_first(dnf_ty_variable:minimize_dnf(ty_node:load(T)), Fixed),
       case known_failure(T, C, Store0, Env) of
         {true, Reads} ->
           fail(maps:merge(Path, reason_of(Reads, C)), merge_reads(Reads0, Reads), Store0, Tr, Env);
@@ -261,6 +261,14 @@ empty(T, S = #s{c = C, x = X, reads = Reads0, store = Store0}, K, Tr, Path, Env)
                  [{exit, Reads0, Tok} | K], [{activation, T, Tok, Reads0} | Tr], Path, Env)
       end
   end.
+
+%% Lines without a polymorphic variable go first: they are the only ones that
+%% can fail on their own, and a variable line only emits a bound.
+-spec ground_first([L], monomorphic_variables()) -> [L] when L :: {[variable()], [variable()], ty_rec:type()}.
+ground_first(Lines, Fixed) ->
+  {Ground, Poly} = lists:partition(
+    fun({P, N, _}) -> lists:all(fun(V) -> maps:is_key(V, Fixed) end, P ++ N) end, Lines),
+  Ground ++ Poly.
 
 %% One DNF line of the variable BDD: alpha_1 & .. & !beta_1 & .. & Leaf <= 0.
 %% The NTLV rule singles out the smallest polymorphic variable into one
@@ -443,15 +451,20 @@ map_line({Pos, Neg, _}, S, K, Tr, Path, Env) ->
 
 %% S1 x .. x Sn \ (N1 | .. | Nk) <= 0, as dnf_ty_tuple:phi_norm: some Si is
 %% empty, or for the first negative tuple N1, for every component i the
-%% product with Si \ N1_i is empty without N1. One decision.
+%% product with Si \ N1_i is empty without N1. One decision, unless a
+%% component is already empty on this path.
 -spec phi([ty:type()], [ty_tuple:type()], s(), k(), trail(), reason(), env()) -> boolean().
-phi(BigS, Neg, S, K, Tr, Path, Env) ->
-  Components = [{empty, Si} || Si <- BigS],
-  Alternatives = case Neg of
-    [] -> Components;
-    [Ty | N] -> Components ++ [{all, without(BigS, ty_tuple:components(Ty), 1, N)}]
-  end,
-  any_of(Alternatives, S, K, Tr, Path, Env).
+phi(BigS, Neg, S = #s{x = X}, K, Tr, Path, Env) ->
+  case lists:any(fun(Si) -> maps:is_key({node, Si}, X) end, BigS) of
+    true -> ret(S, K, Tr, Env);
+    false ->
+      Components = [{empty, Si} || Si <- BigS],
+      Alternatives = case Neg of
+        [] -> Components;
+        [Ty | N] -> Components ++ [{all, without(BigS, ty_tuple:components(Ty), 1, N)}]
+      end,
+      any_of(Alternatives, S, K, Tr, Path, Env)
+  end.
 
 -spec without([ty:type()], [ty:type()], pos_integer(), [ty_tuple:type()]) -> [goal()].
 without(_BigS, [], _I, _N) -> [];
@@ -477,18 +490,23 @@ function_line({Pos, Neg, _}, S, K, Tr, Path, Env) ->
   any_of(Alternatives, S, K, Tr, Path, Env).
 
 %% As dnf_ty_function:explore_function_norm: T1 empty, or T2 empty, or the
-%% positive arrow S1 -> S2 is split off on both sides. One decision.
+%% positive arrow S1 -> S2 is split off on both sides. One decision, unless
+%% T1 or T2 is already empty on this path.
 -spec explore(ty:type(), ty:type(), [ty_function:type()], s(), k(), trail(), reason(), env()) -> boolean().
 explore(T1, T2, [], S, K, Tr, Path, Env) ->
   any_of([{empty, T1}, {empty, T2}], S, K, Tr, Path, Env);
-explore(T1, T2, [F | Ps], S, K, Tr, Path, Env) ->
-  S1 = ty_function:domain(F),
-  S2 = ty_function:codomain(F),
-  any_of([{empty, T1},
-          {empty, T2},
-          {all, [{explore, T1, ty_node:intersect(T2, S2), Ps},
-                 {explore, ty_node:difference(T1, S1), T2, Ps}]}],
-         S, K, Tr, Path, Env).
+explore(T1, T2, [F | Ps], S = #s{x = X}, K, Tr, Path, Env) ->
+  case maps:is_key({node, T1}, X) orelse maps:is_key({node, T2}, X) of
+    true -> ret(S, K, Tr, Env);
+    false ->
+      S1 = ty_function:domain(F),
+      S2 = ty_function:codomain(F),
+      any_of([{empty, T1},
+              {empty, T2},
+              {all, [{explore, T1, ty_node:intersect(T2, S2), Ps},
+                     {explore, ty_node:difference(T1, S1), T2, Ps}]}],
+             S, K, Tr, Path, Env)
+  end.
 
 %% --- bounds -----------------------------------------------------------------
 
