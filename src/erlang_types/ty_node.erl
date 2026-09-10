@@ -580,7 +580,7 @@ collect_node_refs(Body) ->
 %% the children, which this walk then visits itself. Results are memoized in
 %% ETS as well, since substitute/2 asks for them per node.
 %% A run-wide memo for piking: what the search derives from a node alone.
--spec cached(term(), fun(() -> T)) -> T.
+-spec cached(term(), fun(() -> term())) -> term().
 cached(Key, Compute) ->
   case ets:lookup(?PIKECACHE, Key) of
     [{_, Value}] -> Value;
