@@ -180,11 +180,11 @@ all_goal(Goals) -> fun(S, K, Path) -> all_of(Goals, S, K, Path) end.
 %% set, hands its reads on to the continuation, and if it fails before the
 %% continuation ever ran, {T, reads} is learned.
 -spec empty(ty:type(), s(), k(), reason(), env()) -> result().
-empty(T, S = #s{c = C, x = X, reads = Reads0, store = Store0}, K, Path, Env) ->
+empty(T, S = #s{c = C, x = X, reads = Reads0, store = Store0}, K, Path, Env = #env{fixed = Fixed}) ->
   case X of
     #{{node, T} := _} -> K(S);
     _ ->
-      Lines = dnf_ty_variable:minimize_dnf(ty_node:load(T)),
+      Lines = ground_first(dnf_ty_variable:minimize_dnf(ty_node:load(T)), Fixed),
       Goals = [fun(S1, K2, P1) -> line(L, S1, K2, P1, Env) end || L <- Lines],
       case known_failure(T, C, Store0, Env) of
         {true, Reads} ->
@@ -209,6 +209,14 @@ empty(T, S = #s{c = C, x = X, reads = Reads0, store = Store0}, K, Path, Env) ->
           end
       end
   end.
+
+%% Lines without a polymorphic variable go first: they are the only ones that
+%% can fail on their own, and a variable line only emits a bound.
+-spec ground_first([L], monomorphic_variables()) -> [L] when L :: {[variable()], [variable()], ty_rec:type()}.
+ground_first(Lines, Fixed) ->
+  {Ground, Poly} = lists:partition(
+    fun({P, N, _}) -> lists:all(fun(V) -> maps:is_key(V, Fixed) end, P ++ N) end, Lines),
+  Ground ++ Poly.
 
 %% One DNF line of the variable BDD: alpha_1 & .. & !beta_1 & .. & Leaf <= 0.
 %% The NTLV rule singles out the smallest polymorphic variable into one
@@ -400,15 +408,20 @@ map_line({Pos, Neg, _}, S, K, Path, Env) ->
 
 %% S1 x .. x Sn \ (N1 | .. | Nk) <= 0, as dnf_ty_tuple:phi_norm: some Si is
 %% empty, or for the first negative tuple N1, for every component i the
-%% product with Si \ N1_i is empty without N1. One decision.
+%% product with Si \ N1_i is empty without N1. One decision, unless a
+%% component is already empty on this path.
 -spec phi([ty:type()], [ty_tuple:type()], s(), k(), reason(), env()) -> result().
-phi(BigS, Neg, S, K, Path, Env) ->
-  Components = [empty_goal(Si, Env) || Si <- BigS],
-  Alternatives = case Neg of
-    [] -> Components;
-    [Ty | N] -> Components ++ [all_goal(without(BigS, ty_tuple:components(Ty), 1, N, Env))]
-  end,
-  any_of(Alternatives, S, K, Path).
+phi(BigS, Neg, S = #s{x = X}, K, Path, Env) ->
+  case lists:any(fun(Si) -> maps:is_key({node, Si}, X) end, BigS) of
+    true -> K(S);
+    false ->
+      Components = [empty_goal(Si, Env) || Si <- BigS],
+      Alternatives = case Neg of
+        [] -> Components;
+        [Ty | N] -> Components ++ [all_goal(without(BigS, ty_tuple:components(Ty), 1, N, Env))]
+      end,
+      any_of(Alternatives, S, K, Path)
+  end.
 
 -spec without([ty:type()], [ty:type()], pos_integer(), [ty_tuple:type()], env()) -> [goal()].
 without(_BigS, [], _I, _N, _Env) -> [];
@@ -434,18 +447,23 @@ function_line({Pos, Neg, _}, S, K, Path, Env) ->
   any_of(Alternatives, S, K, Path).
 
 %% As dnf_ty_function:explore_function_norm: T1 empty, or T2 empty, or the
-%% positive arrow S1 -> S2 is split off on both sides. One decision.
+%% positive arrow S1 -> S2 is split off on both sides. One decision, unless
+%% T1 or T2 is already empty on this path.
 -spec explore(ty:type(), ty:type(), [ty_function:type()], s(), k(), reason(), env()) -> result().
 explore(T1, T2, [], S, K, Path, Env) ->
   any_of([empty_goal(T1, Env), empty_goal(T2, Env)], S, K, Path);
-explore(T1, T2, [F | Ps], S, K, Path, Env) ->
-  S1 = ty_function:domain(F),
-  S2 = ty_function:codomain(F),
-  any_of([empty_goal(T1, Env),
-          empty_goal(T2, Env),
-          all_goal([explore_goal(T1, ty_node:intersect(T2, S2), Ps, Env),
-                    explore_goal(ty_node:difference(T1, S1), T2, Ps, Env)])],
-         S, K, Path).
+explore(T1, T2, [F | Ps], S = #s{x = X}, K, Path, Env) ->
+  case maps:is_key({node, T1}, X) orelse maps:is_key({node, T2}, X) of
+    true -> K(S);
+    false ->
+      S1 = ty_function:domain(F),
+      S2 = ty_function:codomain(F),
+      any_of([empty_goal(T1, Env),
+              empty_goal(T2, Env),
+              all_goal([explore_goal(T1, ty_node:intersect(T2, S2), Ps, Env),
+                        explore_goal(ty_node:difference(T1, S1), T2, Ps, Env)])],
+             S, K, Path)
+  end.
 
 %% --- bounds -----------------------------------------------------------------
 
