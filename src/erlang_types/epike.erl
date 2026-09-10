@@ -16,7 +16,7 @@
 %% current bounds C" is a *goal* that is searched, one choice at a time, in
 %% continuation-passing style: an AND (every DNF line, every tuple
 %% component) is a chain of continuations, an OR (some component empty, some
-%% negative arrow refuting the line) is a choice point that backtracks, and a
+%% negative arrow refuting the line) is a decision that backtracks, and a
 %% leaf emits ONE one-sided bound -- alpha <= single(...) or single(...) <=
 %% alpha, the NTLV rule -- which is merged into C on the spot. When the merge
 %% tightens an existing bound, the consequence that saturation would add
@@ -28,10 +28,24 @@
 %%
 %%   partial assignment      the bound map C : variable -> {Lower, Upper}
 %%   literal                 one one-sided bound from the NTLV rule
-%%   clause / decision       an OR of the tuple or function decomposition
+%%   decision                an OR of the tuple or function decomposition
 %%   theory propagation      the consequence goal of a tightened pair
 %%   conflict                a leaf that cannot be made empty under C
+%%   conflict analysis       the reason set of a failure: the decisions the
+%%                           bounds it read depend on
+%%   backjumping             a decision that a failure does not depend on
+%%                           does not try its other alternatives
 %%   model                   the final continuation reached
+%%
+%% The reasons are what makes the search tractable where normalize is: a
+%% tuple or function decomposition has many independent decisions, and a
+%% later constraint that fails for reasons of its own must not make the
+%% search enumerate their product. Every bound piece carries the decisions
+%% it depends on (the path of decisions above the leaf that emitted it), a
+%% consequence goal inherits the reasons of both pieces it relates, a ground
+%% leaf that cannot be made empty fails with the reasons of its goal, and a
+%% decision whose alternative fails for a reason it is not part of fails
+%% with that reason at once.
 %%
 %% Ground goals -- types whose variables are all monomorphic -- are decided
 %% by the subtyping engine (ty_node:is_empty, cached in ETS), never walked.
@@ -43,28 +57,36 @@
 %%
 %% Piking searches exactly the tree normalize + saturate materialize:
 %% the same minimized lines, the same singled bounds, the same
-%% decompositions in the same order, with two prunings that lose no answer.
-%% A goal achieved on the path is not redone (C already lies inside it, the
-%% other alternatives only tighten C, and any leaf below a tighter set has a
-%% solution that also satisfies C and the pending goals). And the
-%% consequence of a tightened pair is its incremental part: every pair
-%% (lower piece, upper piece) is covered when the later of the two arrives.
+%% decompositions, with prunings that lose no answer. A goal achieved on the
+%% path is not redone (C already lies inside it, the other alternatives only
+%% tighten C, and any leaf below a tighter set has a solution that also
+%% satisfies C and the pending goals). The consequence of a tightened pair is
+%% its incremental part: every pair (lower piece, upper piece) is covered
+%% when the later of the two arrives. And a backjump skips alternatives only
+%% when the failure read no bound that the decision produced, so the same
+%% failure exists under every alternative.
 
 -export([is_satisfiable/2]).
 
 -include("constraints.hrl").
 
 -type input_constraints() :: [{ty:type(), ty:type()}].
-%% C: the current bounds of every variable constrained so far.
--type bounds() :: #{variable() => {ty:type(), ty:type()}}.
+%% The decisions a bound piece, a goal or a failure depends on.
+-type reason() :: #{integer() => []}.
+%% C: the bounds of every variable constrained so far, each side with the
+%% decisions its pieces depend on.
+-type bounds() :: #{variable() => {ty:type(), ty:type(), reason(), reason()}}.
 %% X: goals achieved or assumed on the current path. {node, T} is added when
 %% empty(T) starts (coinductive hypothesis) and stays; phi and explore keys
 %% are added when the sub-goal completes.
 -type achieved() :: #{term() => []}.
+-type result() :: true | {false, reason()}.
 %% The rest of the search after a goal: takes the bounds and achieved set
-%% the goal produced, returns whether the whole remaining search succeeds.
--type k() :: fun((bounds(), achieved()) -> boolean()).
--type goal() :: fun((bounds(), achieved(), k()) -> boolean()).
+%% the goal produced, returns whether the whole remaining search succeeds
+%% and, if not, why.
+-type k() :: fun((bounds(), achieved()) -> result()).
+%% A goal runs under the decisions its existence depends on.
+-type goal() :: fun((bounds(), achieved(), k(), reason()) -> result()).
 
 -record(env, {
   fixed :: monomorphic_variables(),
@@ -80,7 +102,10 @@ is_satisfiable(Constraints, Fixed) ->
              stats = os:getenv("PIKE_STATS") =/= false},
   stats_start(Env),
   Goals = [empty_goal(ty_node:difference(S, T), Env) || {S, T} <- Constraints],
-  Result = all_of(Goals, #{}, #{}, fun(_C, _X) -> true end),
+  Result = case all_of(Goals, #{}, #{}, fun(_C, _X) -> true end, #{}) of
+    true -> true;
+    {false, _Reason} -> false
+  end,
   stats_stop(Env, length(Constraints), Result),
   Result.
 
@@ -88,33 +113,57 @@ is_satisfiable(Constraints, Fixed) ->
 
 %% A conjunction: each goal runs with the rest of the conjunction as its
 %% continuation, so a later conjunct that fails backtracks into the choices
-%% of the earlier ones.
--spec all_of([goal()], bounds(), achieved(), k()) -> boolean().
-all_of([], C, X, K) -> K(C, X);
-all_of([G | Gs], C, X, K) ->
-  G(C, X, fun(C1, X1) -> all_of(Gs, C1, X1, K) end).
+%% of the earlier ones -- or past them, if its reason does not involve them.
+-spec all_of([goal()], bounds(), achieved(), k(), reason()) -> result().
+all_of([], C, X, K, _Path) -> K(C, X);
+all_of([G | Gs], C, X, K, Path) ->
+  G(C, X, fun(C1, X1) -> all_of(Gs, C1, X1, K, Path) end, Path).
 
-%% A disjunction: a choice point. The first alternative under which the
-%% whole remaining search succeeds answers the query.
--spec any_of([goal()], bounds(), achieved(), k()) -> boolean().
-any_of([], _C, _X, _K) -> false;
-any_of([G | Gs], C, X, K) ->
-  G(C, X, K) orelse (bump(backtracks) andalso any_of(Gs, C, X, K)).
+%% A disjunction: a decision. The first alternative under which the whole
+%% remaining search succeeds answers the query. An alternative that fails
+%% for a reason this decision is not part of fails the decision at once,
+%% since the same failure exists under every other alternative; otherwise
+%% the next alternative is tried, and the reasons of all of them, minus the
+%% decision itself, are the reason the decision fails.
+-spec any_of([goal()], bounds(), achieved(), k(), reason()) -> result().
+any_of([], _C, _X, _K, Path) -> {false, Path};
+any_of(Goals, C, X, K, Path) ->
+  D = erlang:unique_integer([positive]),
+  decide(Goals, C, X, K, Path, D, #{}).
+
+-spec decide([goal()], bounds(), achieved(), k(), reason(), integer(), reason()) -> result().
+decide([], _C, _X, _K, _Path, D, Acc) -> {false, maps:remove(D, Acc)};
+decide([G | Gs], C, X, K, Path, D, Acc) ->
+  case G(C, X, K, Path#{D => []}) of
+    true -> true;
+    {false, R} ->
+      case R of
+        #{D := _} ->
+          bump(backtracks),
+          decide(Gs, C, X, K, Path, D, maps:merge(Acc, R));
+        _ ->
+          bump(backjumps),
+          {false, R}
+      end
+  end.
 
 -spec empty_goal(ty:type(), env()) -> goal().
-empty_goal(T, Env) -> fun(C, X, K) -> empty(T, C, X, K, Env) end.
+empty_goal(T, Env) -> fun(C, X, K, Path) -> empty(T, C, X, K, Path, Env) end.
 
 -spec phi_goal([ty:type()], [ty_tuple:type()], env()) -> goal().
-phi_goal(BigS, Neg, Env) -> fun(C, X, K) -> phi(BigS, Neg, C, X, K, Env) end.
+phi_goal(BigS, Neg, Env) -> fun(C, X, K, Path) -> phi(BigS, Neg, C, X, K, Path, Env) end.
 
 -spec explore_goal(ty:type(), ty:type(), [ty_function:type()], env()) -> goal().
-explore_goal(T1, T2, P, Env) -> fun(C, X, K) -> explore(T1, T2, P, C, X, K, Env) end.
+explore_goal(T1, T2, P, Env) -> fun(C, X, K, Path) -> explore(T1, T2, P, C, X, K, Path, Env) end.
+
+-spec all_goal([goal()]) -> goal().
+all_goal(Goals) -> fun(C, X, K, Path) -> all_of(Goals, C, X, K, Path) end.
 
 %% --- the variable level -----------------------------------------------------
 
 %% Make the node T empty under C.
--spec empty(ty:type(), bounds(), achieved(), k(), env()) -> boolean().
-empty(T, C, X, K, Env = #env{fixed = Fixed}) ->
+-spec empty(ty:type(), bounds(), achieved(), k(), reason(), env()) -> result().
+empty(T, C, X, K, Path, Env = #env{fixed = Fixed}) ->
   case X of
     #{{node, T} := _} -> K(C, X);
     _ ->
@@ -123,13 +172,13 @@ empty(T, C, X, K, Env = #env{fixed = Fixed}) ->
           bump(ground),
           case ty_node:is_empty(T) of
             true -> K(C, X);
-            false -> false
+            false -> {false, Path}
           end;
         false ->
           bump(nodes),
           Lines = dnf_ty_variable:minimize_dnf(ty_node:load(T)),
-          Goals = [fun(C1, X1, K1) -> line(L, C1, X1, K1, Env) end || L <- Lines],
-          all_of(Goals, C, X#{{node, T} => []}, K)
+          Goals = [fun(C1, X1, K1, P1) -> line(L, C1, X1, K1, P1, Env) end || L <- Lines],
+          all_of(Goals, C, X#{{node, T} => []}, K, Path)
       end
   end.
 
@@ -143,75 +192,76 @@ is_ground(T, Fixed) ->
 %% One DNF line of the variable BDD: alpha_1 & .. & !beta_1 & .. & Leaf <= 0.
 %% The NTLV rule singles out the smallest polymorphic variable into one
 %% one-sided bound; a line without one is the leaf's problem.
--spec line({[variable()], [variable()], ty_rec:type()}, bounds(), achieved(), k(), env()) -> boolean().
-line({[], [], Leaf}, C, X, K, Env) ->
-  leaf_empty(Leaf, C, X, K, Env);
-line({P, N, Leaf}, C, X, K, Env = #env{fixed = Fixed}) ->
+-spec line({[variable()], [variable()], ty_rec:type()}, bounds(), achieved(), k(), reason(), env()) -> result().
+line({[], [], Leaf}, C, X, K, Path, Env) ->
+  leaf_empty(Leaf, C, X, K, Path, Env);
+line({P, N, Leaf}, C, X, K, Path, Env = #env{fixed = Fixed}) ->
   case dnf_ty_variable:smallest(P, N, Fixed) of
     {{pos, V}, _} ->
       U = ty_node:make(dnf_ty_variable:single(true, P -- [V], N, Leaf)),
-      bound_upper(V, U, C, X, K, Env);
+      bound_upper(V, U, C, X, K, Path, Env);
     {{neg, V}, _} ->
       L = ty_node:make(dnf_ty_variable:single(false, P, N -- [V], Leaf)),
-      bound_lower(V, L, C, X, K, Env);
+      bound_lower(V, L, C, X, K, Path, Env);
     {{{delta, _}, _}, _} ->
       % only monomorphic variables: they are eliminated (Part 1, Lemma C.3/C.11)
-      leaf_empty(Leaf, C, X, K, Env)
+      leaf_empty(Leaf, C, X, K, Path, Env)
   end.
 
-%% alpha <= U. Tightening an existing upper bound obliges the lower bound to
-%% fit under the new piece: CL <= U, an empty goal on CL \ U.
--spec bound_upper(variable(), ty:type(), bounds(), achieved(), k(), env()) -> boolean().
-bound_upper(V, U, C, X, K, Env = #env{empty = Empty}) ->
+%% alpha <= U, a piece depending on Path. Tightening an existing upper bound
+%% obliges the lower bound to fit under the new piece: CL <= U, an empty goal
+%% on CL \ U that depends on both pieces' reasons.
+-spec bound_upper(variable(), ty:type(), bounds(), achieved(), k(), reason(), env()) -> result().
+bound_upper(V, U, C, X, K, Path, Env = #env{empty = Empty}) ->
   bump(bounds),
   case C of
-    #{V := {CL, CU}} ->
+    #{V := {CL, CU, RL, RU}} ->
       case intersect_bound(U, CU, Env) of
         CU -> K(C, X);
         U1 ->
-          C1 = C#{V := {CL, U1}},
+          C1 = C#{V := {CL, U1, RL, maps:merge(RU, Path)}},
           case CL of
             Empty -> K(C1, X);
             _ ->
               bump(consequences),
-              empty(ty_node:difference(CL, U), C1, X, K, Env)
+              empty(ty_node:difference(CL, U), C1, X, K, maps:merge(RL, Path), Env)
           end
       end;
     _ ->
-      K(C#{V => {Empty, U}}, X)
+      K(C#{V => {Empty, U, #{}, Path}}, X)
   end.
 
 %% L <= alpha, symmetric: the new lower piece must fit under the upper bound.
--spec bound_lower(variable(), ty:type(), bounds(), achieved(), k(), env()) -> boolean().
-bound_lower(V, L, C, X, K, Env = #env{any = Any}) ->
+-spec bound_lower(variable(), ty:type(), bounds(), achieved(), k(), reason(), env()) -> result().
+bound_lower(V, L, C, X, K, Path, Env = #env{any = Any}) ->
   bump(bounds),
   case C of
-    #{V := {CL, CU}} ->
+    #{V := {CL, CU, RL, RU}} ->
       case union_bound(L, CL, Env) of
         CL -> K(C, X);
         L1 ->
-          C1 = C#{V := {L1, CU}},
+          C1 = C#{V := {L1, CU, maps:merge(RL, Path), RU}},
           case CU of
             Any -> K(C1, X);
             _ ->
               bump(consequences),
-              empty(ty_node:difference(L, CU), C1, X, K, Env)
+              empty(ty_node:difference(L, CU), C1, X, K, maps:merge(RU, Path), Env)
           end
       end;
     _ ->
-      K(C#{V => {L, Any}}, X)
+      K(C#{V => {L, Any, Path, #{}}}, X)
   end.
 
 %% --- the leaf level ---------------------------------------------------------
 
 %% A variable-free line is empty iff every component of its leaf is. The
 %% basic kinds are decided outright; the structured kinds are searched.
--spec leaf_empty(ty_rec:type(), bounds(), achieved(), k(), env()) -> boolean().
-leaf_empty(any, _C, _X, _K, _Env) -> false;
-leaf_empty(empty, C, X, K, _Env) -> K(C, X);
-leaf_empty(TyRec, C, X, K, Env) ->
+-spec leaf_empty(ty_rec:type(), bounds(), achieved(), k(), reason(), env()) -> result().
+leaf_empty(any, _C, _X, _K, Path, _Env) -> {false, Path};
+leaf_empty(empty, C, X, K, _Path, _Env) -> K(C, X);
+leaf_empty(TyRec, C, X, K, Path, Env) ->
   case basic_empty(TyRec) of
-    false -> false;
+    false -> {false, Path};
     true ->
       {TupDefault, TupArities} = ty_rec:pi(TyRec, ty_tuples),
       {FunDefault, FunArities} = ty_rec:pi(TyRec, ty_functions),
@@ -225,7 +275,7 @@ leaf_empty(TyRec, C, X, K, Env) ->
                       || {_Arity, D} <- lists:sort(maps:to_list(FunArities))]) ++
         function_goals(dnf_ty_function:minimize_dnf(FunDefault), Env) ++
         map_goals(dnf_ty_map:minimize_dnf(ty_rec:pi(TyRec, dnf_ty_map)), Env),
-      all_of(Goals, C, X, K)
+      all_of(Goals, C, X, K, Path)
   end.
 
 -spec basic_empty(ty_rec:type_record()) -> boolean().
@@ -236,41 +286,41 @@ basic_empty(TyRec) ->
 
 -spec tuple_goals([{[ty_tuple:type()], [ty_tuple:type()], ty_bool:type()}], env()) -> [goal()].
 tuple_goals(Lines, Env) ->
-  [fun(C, X, K) -> tuple_line(L, C, X, K, Env) end || L <- Lines].
+  [fun(C, X, K, Path) -> tuple_line(L, C, X, K, Path, Env) end || L <- Lines].
 
 -spec function_goals([{[ty_function:type()], [ty_function:type()], ty_bool:type()}], env()) -> [goal()].
 function_goals(Lines, Env) ->
-  [fun(C, X, K) -> function_line(L, C, X, K, Env) end || L <- Lines].
+  [fun(C, X, K, Path) -> function_line(L, C, X, K, Path, Env) end || L <- Lines].
 
 -spec map_goals([{[ty_map:type()], [ty_map:type()], ty_bool:type()}], env()) -> [goal()].
 map_goals(Lines, Env) ->
-  [fun(C, X, K) -> map_line(L, C, X, K, Env) end || L <- Lines].
+  [fun(C, X, K, Path) -> map_line(L, C, X, K, Path, Env) end || L <- Lines].
 
 %% One line of a tuple (or list, bitstring) DNF, as dnf_ty_tuple:normalize_line.
--spec tuple_line({[ty_tuple:type()], [ty_tuple:type()], ty_bool:type()}, bounds(), achieved(), k(), env()) -> boolean().
-tuple_line({[], [], _}, _C, _X, _K, _Env) -> false; % the whole product: never empty
-tuple_line({[], Neg = [TNeg | _], Leaf}, C, X, K, Env) ->
+-spec tuple_line({[ty_tuple:type()], [ty_tuple:type()], ty_bool:type()}, bounds(), achieved(), k(), reason(), env()) -> result().
+tuple_line({[], [], _}, _C, _X, _K, Path, _Env) -> {false, Path}; % the whole product: never empty
+tuple_line({[], Neg = [TNeg | _], Leaf}, C, X, K, Path, Env) ->
   Dim = length(ty_tuple:components(TNeg)),
-  tuple_line({[ty_tuple:any(Dim)], Neg, Leaf}, C, X, K, Env);
-tuple_line({Pos, Neg, _}, C, X, K, Env) ->
-  phi(ty_tuple:components(ty_tuple:big_intersect(Pos)), Neg, C, X, K, Env).
+  tuple_line({[ty_tuple:any(Dim)], Neg, Leaf}, C, X, K, Path, Env);
+tuple_line({Pos, Neg, _}, C, X, K, Path, Env) ->
+  phi(ty_tuple:components(ty_tuple:big_intersect(Pos)), Neg, C, X, K, Path, Env).
 
 %% One line of a map DNF, as dnf_ty_map:normalize_line: maps are encoded as a
 %% pair of a tuple part and a function part, with its own any.
--spec map_line({[ty_map:type()], [ty_map:type()], ty_bool:type()}, bounds(), achieved(), k(), env()) -> boolean().
-map_line({[], [], _}, _C, _X, _K, _Env) -> false;
-map_line({[], Neg = [_ | _], Leaf}, C, X, K, Env) ->
+-spec map_line({[ty_map:type()], [ty_map:type()], ty_bool:type()}, bounds(), achieved(), k(), reason(), env()) -> result().
+map_line({[], [], _}, _C, _X, _K, Path, _Env) -> {false, Path};
+map_line({[], Neg = [_ | _], Leaf}, C, X, K, Path, Env) ->
   P1 = ty:tuples(ty_tuples:singleton(2, dnf_ty_tuple:any())),
   P2 = ty:functions(ty_functions:singleton(2, dnf_ty_function:any())),
-  map_line({[ty_map:map(P1, P2)], Neg, Leaf}, C, X, K, Env);
-map_line({Pos, Neg, _}, C, X, K, Env) ->
-  phi(ty_tuple:components(ty_tuple:big_intersect(Pos)), Neg, C, X, K, Env).
+  map_line({[ty_map:map(P1, P2)], Neg, Leaf}, C, X, K, Path, Env);
+map_line({Pos, Neg, _}, C, X, K, Path, Env) ->
+  phi(ty_tuple:components(ty_tuple:big_intersect(Pos)), Neg, C, X, K, Path, Env).
 
 %% S1 x .. x Sn \ (N1 | .. | Nk) <= 0, as dnf_ty_tuple:phi_norm: some Si is
 %% empty, or for the first negative tuple N1, for every component i the
-%% product with Si \ N1_i is empty without N1.
--spec phi([ty:type()], [ty_tuple:type()], bounds(), achieved(), k(), env()) -> boolean().
-phi(BigS, Neg, C, X, K, Env) ->
+%% product with Si \ N1_i is empty without N1. One decision.
+-spec phi([ty:type()], [ty_tuple:type()], bounds(), achieved(), k(), reason(), env()) -> result().
+phi(BigS, Neg, C, X, K, Path, Env) ->
   Key = {phi, BigS, Neg},
   case X of
     #{Key := _} -> K(C, X);
@@ -278,12 +328,11 @@ phi(BigS, Neg, C, X, K, Env) ->
       bump(phi),
       K1 = fun(C1, X1) -> K(C1, X1#{Key => []}) end,
       Components = [empty_goal(S, Env) || S <- BigS],
-      case Neg of
-        [] -> any_of(Components, C, X, K1);
-        [Ty | N] ->
-          any_of(Components, C, X, K1)
-            orelse all_of(without(BigS, ty_tuple:components(Ty), 1, N, Env), C, X, K1)
-      end
+      Alternatives = case Neg of
+        [] -> Components;
+        [Ty | N] -> Components ++ [all_goal(without(BigS, ty_tuple:components(Ty), 1, N, Env))]
+      end,
+      any_of(Alternatives, C, X, K1, Path)
   end.
 
 -spec without([ty:type()], [ty:type()], pos_integer(), [ty_tuple:type()], env()) -> [goal()].
@@ -298,26 +347,23 @@ replace_at(I, [H | T], NComp) -> [H | replace_at(I - 1, T, NComp)].
 %% One line of a function DNF, as dnf_ty_function:normalize_line: some
 %% negative arrow T1 -> T2 refutes the intersection of the positive arrows,
 %% which needs T1 inside the union S of the domains and explore to hold.
--spec function_line({[ty_function:type()], [ty_function:type()], ty_bool:type()}, bounds(), achieved(), k(), env()) -> boolean().
-function_line({Pos, Neg, _}, C, X, K, Env) ->
+%% Which negative arrow is one decision.
+-spec function_line({[ty_function:type()], [ty_function:type()], ty_bool:type()}, bounds(), achieved(), k(), reason(), env()) -> result().
+function_line({Pos, Neg, _}, C, X, K, Path, Env) ->
   S = ty_node:disjunction([ty_function:domain(F) || F <- Pos]),
-  function_cont(S, Pos, Neg, C, X, K, Env).
-
--spec function_cont(ty:type(), [ty_function:type()], [ty_function:type()], bounds(), achieved(), k(), env()) -> boolean().
-function_cont(_S, _P, [], _C, _X, _K, _Env) -> false; % no negative arrow: never empty
-function_cont(S, P, [F | N], C, X, K, Env) ->
-  T1 = ty_function:domain(F),
-  T2 = ty_function:codomain(F),
-  all_of([empty_goal(ty_node:intersect(T1, ty_node:negate(S)), Env),
-          explore_goal(T1, ty_node:negate(T2), P, Env)], C, X, K)
-    orelse (bump(backtracks) andalso function_cont(S, P, N, C, X, K, Env)).
+  NotS = ty_node:negate(S),
+  Alternatives =
+    [all_goal([empty_goal(ty_node:intersect(ty_function:domain(F), NotS), Env),
+               explore_goal(ty_function:domain(F), ty_node:negate(ty_function:codomain(F)), Pos, Env)])
+     || F <- Neg],
+  any_of(Alternatives, C, X, K, Path).
 
 %% As dnf_ty_function:explore_function_norm: T1 empty, or T2 empty, or the
-%% positive arrow S1 -> S2 is split off on both sides.
--spec explore(ty:type(), ty:type(), [ty_function:type()], bounds(), achieved(), k(), env()) -> boolean().
-explore(T1, T2, [], C, X, K, Env) ->
-  any_of([empty_goal(T1, Env), empty_goal(T2, Env)], C, X, K);
-explore(T1, T2, P = [F | Ps], C, X, K, Env) ->
+%% positive arrow S1 -> S2 is split off on both sides. One decision.
+-spec explore(ty:type(), ty:type(), [ty_function:type()], bounds(), achieved(), k(), reason(), env()) -> result().
+explore(T1, T2, [], C, X, K, Path, Env) ->
+  any_of([empty_goal(T1, Env), empty_goal(T2, Env)], C, X, K, Path);
+explore(T1, T2, P = [F | Ps], C, X, K, Path, Env) ->
   Key = {explore, T1, T2, P},
   case X of
     #{Key := _} -> K(C, X);
@@ -326,9 +372,11 @@ explore(T1, T2, P = [F | Ps], C, X, K, Env) ->
       K1 = fun(C1, X1) -> K(C1, X1#{Key => []}) end,
       S1 = ty_function:domain(F),
       S2 = ty_function:codomain(F),
-      any_of([empty_goal(T1, Env), empty_goal(T2, Env)], C, X, K1)
-        orelse all_of([explore_goal(T1, ty_node:intersect(T2, S2), Ps, Env),
-                       explore_goal(ty_node:difference(T1, S1), T2, Ps, Env)], C, X, K1)
+      any_of([empty_goal(T1, Env),
+              empty_goal(T2, Env),
+              all_goal([explore_goal(T1, ty_node:intersect(T2, S2), Ps, Env),
+                        explore_goal(ty_node:difference(T1, S1), T2, Ps, Env)])],
+             C, X, K1, Path)
   end.
 
 %% --- bounds -----------------------------------------------------------------
@@ -348,13 +396,13 @@ intersect_bound(A, B, _Env) -> ty_node:intersect(A, B).
 
 %% --- counters, metrics only, enabled with PIKE_STATS ------------------------
 
--spec bump(atom()) -> true.
+-spec bump(atom()) -> ok.
 bump(Key) ->
   case get(pike_stats) of
-    undefined -> true;
+    undefined -> ok;
     Counts ->
       put(pike_stats, maps:update_with(Key, fun(N) -> N + 1 end, 1, Counts)),
-      true
+      ok
   end.
 
 -spec stats_start(env()) -> ok.
@@ -372,7 +420,7 @@ stats_stop(_Env, N, Result) ->
   erase(pike_stats),
   Get = fun(K) -> maps:get(K, Counts, 0) end,
   io:format(user, "[pike] sat=~p constraints=~p nodes=~p ground=~p bounds=~p "
-                  "consequences=~p phi=~p explore=~p backtracks=~p time=~.1fms~n",
+                  "consequences=~p phi=~p explore=~p backtracks=~p backjumps=~p time=~.1fms~n",
             [Result, N, Get(nodes), Get(ground), Get(bounds), Get(consequences),
-             Get(phi), Get(explore), Get(backtracks), Us / 1000]),
+             Get(phi), Get(explore), Get(backtracks), Get(backjumps), Us / 1000]),
   ok.
