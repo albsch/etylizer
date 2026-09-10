@@ -176,7 +176,7 @@ empty(T, C, X, K, Path, Env = #env{fixed = Fixed}) ->
           end;
         false ->
           bump(nodes),
-          Lines = dnf_ty_variable:minimize_dnf(ty_node:load(T)),
+          Lines = ground_first(dnf_ty_variable:minimize_dnf(ty_node:load(T)), Fixed),
           Goals = [fun(C1, X1, K1, P1) -> line(L, C1, X1, K1, P1, Env) end || L <- Lines],
           all_of(Goals, C, X#{{node, T} => []}, K, Path)
       end
@@ -185,6 +185,14 @@ empty(T, C, X, K, Path, Env = #env{fixed = Fixed}) ->
 %% A type all of whose variables are monomorphic is a constant for tallying:
 %% the subtyping engine decides it, treating those variables as atoms exactly
 %% as the delta rule of normalize_line does.
+%% Lines without a polymorphic variable go first: they are the only ones that
+%% can fail on their own, and a variable line only emits a bound.
+-spec ground_first([L], monomorphic_variables()) -> [L] when L :: {[variable()], [variable()], ty_rec:type()}.
+ground_first(Lines, Fixed) ->
+  {Ground, Poly} = lists:partition(
+    fun({P, N, _}) -> lists:all(fun(V) -> maps:is_key(V, Fixed) end, P ++ N) end, Lines),
+  Ground ++ Poly.
+
 -spec is_ground(ty:type(), monomorphic_variables()) -> boolean().
 is_ground(T, Fixed) ->
   lists:all(fun(V) -> maps:is_key(V, Fixed) end, sets:to_list(ty_node:all_variables(T))).
@@ -327,12 +335,18 @@ phi(BigS, Neg, C, X, K, Path, Env) ->
     _ ->
       bump(phi),
       K1 = fun(C1, X1) -> K(C1, X1#{Key => []}) end,
-      Components = [empty_goal(S, Env) || S <- BigS],
-      Alternatives = case Neg of
-        [] -> Components;
-        [Ty | N] -> Components ++ [all_goal(without(BigS, ty_tuple:components(Ty), 1, N, Env))]
-      end,
-      any_of(Alternatives, C, X, K1, Path)
+      case lists:any(fun(S) -> maps:is_key({node, S}, X) end, BigS) of
+        true ->
+          % a component is already empty on this path: no decision to make
+          K1(C, X);
+        false ->
+          Components = [empty_goal(S, Env) || S <- BigS],
+          Alternatives = case Neg of
+            [] -> Components;
+            [Ty | N] -> Components ++ [all_goal(without(BigS, ty_tuple:components(Ty), 1, N, Env))]
+          end,
+          any_of(Alternatives, C, X, K1, Path)
+      end
   end.
 
 -spec without([ty:type()], [ty:type()], pos_integer(), [ty_tuple:type()], env()) -> [goal()].
@@ -370,13 +384,17 @@ explore(T1, T2, P = [F | Ps], C, X, K, Path, Env) ->
     _ ->
       bump(explore),
       K1 = fun(C1, X1) -> K(C1, X1#{Key => []}) end,
-      S1 = ty_function:domain(F),
-      S2 = ty_function:codomain(F),
-      any_of([empty_goal(T1, Env),
-              empty_goal(T2, Env),
-              all_goal([explore_goal(T1, ty_node:intersect(T2, S2), Ps, Env),
-                        explore_goal(ty_node:difference(T1, S1), T2, Ps, Env)])],
-             C, X, K1, Path)
+      case maps:is_key({node, T1}, X) orelse maps:is_key({node, T2}, X) of
+        true -> K1(C, X);
+        false ->
+          S1 = ty_function:domain(F),
+          S2 = ty_function:codomain(F),
+          any_of([empty_goal(T1, Env),
+                  empty_goal(T2, Env),
+                  all_goal([explore_goal(T1, ty_node:intersect(T2, S2), Ps, Env),
+                            explore_goal(ty_node:difference(T1, S1), T2, Ps, Env)])],
+                 C, X, K1, Path)
+      end
   end.
 
 %% --- bounds -----------------------------------------------------------------
