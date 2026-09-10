@@ -282,20 +282,49 @@ empty_node(T, S = #s{c = C, x = X, epoch = E0, reads = Reads0, tok = Tok0, learn
 %% of the line -- and a line without one is its leaf, whose monomorphic
 %% variables are eliminated (Part 1, Lemma C.3/C.11). Leaves go first: they
 %% are the only lines that can fail on their own.
--type prepared() :: {leaf, ty_rec:type()} | {upper, variable(), ty:type()} | {lower, variable(), ty:type()}.
+%% A leaf is prepared too: a leaf one of whose basic kinds is not empty is a
+%% dead line, which goes first since it fails on its own; otherwise the
+%% lines of its structured components, each a tuple, function or map line.
+-type component() :: {tuple, tuple_dnf_line()} | {function, function_dnf_line()} | {map, map_dnf_line()}.
+-type tuple_dnf_line() :: {[ty_tuple:type()], [ty_tuple:type()], ty_bool:type()}.
+-type function_dnf_line() :: {[ty_function:type()], [ty_function:type()], ty_bool:type()}.
+-type map_dnf_line() :: {[ty_map:type()], [ty_map:type()], ty_bool:type()}.
+-type prepared() :: dead | {leaf, integer(), [component()]}
+                  | {upper, variable(), ty:type()} | {lower, variable(), ty:type()}.
 -spec prepare([{[variable()], [variable()], ty_rec:type()}], monomorphic_variables()) -> [prepared()].
 prepare(Lines, Fixed) ->
   Prepared = [prepare_line(L, Fixed) || L <- Lines],
-  {Leaves, Bounds} = lists:partition(fun({leaf, _}) -> true; (_) -> false end, Prepared),
-  Leaves ++ Bounds.
+  {Dead, Rest} = lists:partition(fun(dead) -> true; (_) -> false end, Prepared),
+  {Leaves, Bounds} = lists:partition(fun({leaf, _, _}) -> true; (_) -> false end, Rest),
+  Dead ++ Leaves ++ Bounds.
 
 -spec prepare_line({[variable()], [variable()], ty_rec:type()}, monomorphic_variables()) -> prepared().
-prepare_line({[], [], Leaf}, _Fixed) -> {leaf, Leaf};
+prepare_line({[], [], Leaf}, _Fixed) -> prepare_leaf(Leaf);
 prepare_line({P, N, Leaf}, Fixed) ->
   case dnf_ty_variable:smallest(P, N, Fixed) of
     {{pos, V}, _} -> {upper, V, ty_node:make(dnf_ty_variable:single(true, P -- [V], N, Leaf))};
     {{neg, V}, _} -> {lower, V, ty_node:make(dnf_ty_variable:single(false, P, N -- [V], Leaf))};
-    {{{delta, _}, _}, _} -> {leaf, Leaf}
+    {{{delta, _}, _}, _} -> prepare_leaf(Leaf)
+  end.
+
+-spec prepare_leaf(ty_rec:type()) -> prepared().
+prepare_leaf(any) -> dead;
+prepare_leaf(empty) -> {leaf, erlang:unique_integer([positive]), []};
+prepare_leaf(TyRec) ->
+  case basic_empty(TyRec) of
+    false -> dead;
+    true ->
+      {TupDefault, TupArities} = ty_rec:pi(TyRec, ty_tuples),
+      {FunDefault, FunArities} = ty_rec:pi(TyRec, ty_functions),
+      Components =
+        [{tuple, L} || L <- dnf_ty_list:minimize_dnf(ty_rec:pi(TyRec, dnf_ty_list))] ++
+        [{tuple, L} || L <- dnf_ty_bitstring:minimize_dnf(ty_rec:pi(TyRec, dnf_ty_bitstring))] ++
+        [{tuple, L} || {_Arity, D} <- lists:sort(maps:to_list(TupArities)), L <- dnf_ty_tuple:minimize_dnf(D)] ++
+        [{tuple, L} || L <- dnf_ty_tuple:minimize_dnf(TupDefault)] ++
+        [{function, L} || {_Arity, D} <- lists:sort(maps:to_list(FunArities)), L <- dnf_ty_function:minimize_dnf(D)] ++
+        [{function, L} || L <- dnf_ty_function:minimize_dnf(FunDefault)] ++
+        [{map, L} || L <- dnf_ty_map:minimize_dnf(ty_rec:pi(TyRec, dnf_ty_map))],
+      {leaf, erlang:unique_integer([positive]), Components}
   end.
 
 %% A type all of whose variables are monomorphic is a constant for tallying:
@@ -310,7 +339,10 @@ is_ground(T, Fixed) ->
 %% One prepared line: alpha_1 & .. & !beta_1 & .. & Leaf <= 0 is a bound on
 %% its smallest polymorphic variable, or its leaf's problem.
 -spec line(prepared(), s(), k(), reason(), env()) -> result().
-line({leaf, Leaf}, S, K, Path, Env) -> leaf_empty(Leaf, S, K, Path, Env);
+line(dead, #s{reads = Reads, learned = Learned}, _K, Path, _Env) -> {false, Path, Reads, Learned};
+line({leaf, Id, Components}, S, K, Path, Env) ->
+  Goals = [fun(S0, K0, P0) -> component(C, S0, K0, P0, Env) end || C <- Components],
+  all_of({leaf, Id}, Goals, S, K, Path);
 line({upper, V, U}, S, K, Path, Env) -> bound_upper(V, U, S, K, Path, Env);
 line({lower, V, L}, S, K, Path, Env) -> bound_lower(V, L, S, K, Path, Env).
 
@@ -448,47 +480,17 @@ present([Read = {V, Side, Node} | Rest], C, Found) ->
 
 %% --- the leaf level ---------------------------------------------------------
 
-%% A variable-free line is empty iff every component of its leaf is. The
-%% basic kinds are decided outright; the structured kinds are searched.
--spec leaf_empty(ty_rec:type(), s(), k(), reason(), env()) -> result().
-leaf_empty(any, #s{reads = Reads, learned = Learned}, _K, Path, _Env) -> {false, Path, Reads, Learned};
-leaf_empty(empty, S, K, _Path, _Env) -> K(S);
-leaf_empty(TyRec, S = #s{reads = Reads, learned = Learned}, K, Path, Env) ->
-  case basic_empty(TyRec) of
-    false -> {false, Path, Reads, Learned};
-    true ->
-      {TupDefault, TupArities} = ty_rec:pi(TyRec, ty_tuples),
-      {FunDefault, FunArities} = ty_rec:pi(TyRec, ty_functions),
-      Goals =
-        tuple_goals(dnf_ty_list:minimize_dnf(ty_rec:pi(TyRec, dnf_ty_list)), Env) ++
-        tuple_goals(dnf_ty_bitstring:minimize_dnf(ty_rec:pi(TyRec, dnf_ty_bitstring)), Env) ++
-        lists:append([tuple_goals(dnf_ty_tuple:minimize_dnf(D), Env)
-                      || {_Arity, D} <- lists:sort(maps:to_list(TupArities))]) ++
-        tuple_goals(dnf_ty_tuple:minimize_dnf(TupDefault), Env) ++
-        lists:append([function_goals(dnf_ty_function:minimize_dnf(D), Env)
-                      || {_Arity, D} <- lists:sort(maps:to_list(FunArities))]) ++
-        function_goals(dnf_ty_function:minimize_dnf(FunDefault), Env) ++
-        map_goals(dnf_ty_map:minimize_dnf(ty_rec:pi(TyRec, dnf_ty_map)), Env),
-      all_of({leaf, TyRec}, Goals, S, K, Path)
-  end.
+%% One structured component of a leaf.
+-spec component(component(), s(), k(), reason(), env()) -> result().
+component({tuple, L}, S, K, Path, Env) -> tuple_line(L, S, K, Path, Env);
+component({function, L}, S, K, Path, Env) -> function_line(L, S, K, Path, Env);
+component({map, L}, S, K, Path, Env) -> map_line(L, S, K, Path, Env).
 
 -spec basic_empty(ty_rec:type_record()) -> boolean().
 basic_empty(TyRec) ->
   element(1, dnf_ty_predefined:is_empty(ty_rec:pi(TyRec, dnf_ty_predefined), #{}))
     andalso element(1, dnf_ty_atom:is_empty(ty_rec:pi(TyRec, dnf_ty_atom), #{}))
     andalso element(1, dnf_ty_interval:is_empty(ty_rec:pi(TyRec, dnf_ty_interval), #{})).
-
--spec tuple_goals([{[ty_tuple:type()], [ty_tuple:type()], ty_bool:type()}], env()) -> [goal()].
-tuple_goals(Lines, Env) ->
-  [fun(S, K, Path) -> tuple_line(L, S, K, Path, Env) end || L <- Lines].
-
--spec function_goals([{[ty_function:type()], [ty_function:type()], ty_bool:type()}], env()) -> [goal()].
-function_goals(Lines, Env) ->
-  [fun(S, K, Path) -> function_line(L, S, K, Path, Env) end || L <- Lines].
-
--spec map_goals([{[ty_map:type()], [ty_map:type()], ty_bool:type()}], env()) -> [goal()].
-map_goals(Lines, Env) ->
-  [fun(S, K, Path) -> map_line(L, S, K, Path, Env) end || L <- Lines].
 
 %% One line of a tuple (or list, bitstring) DNF, as dnf_ty_tuple:normalize_line.
 -spec tuple_line({[ty_tuple:type()], [ty_tuple:type()], ty_bool:type()}, s(), k(), reason(), env()) -> result().
