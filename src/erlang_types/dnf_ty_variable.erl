@@ -13,7 +13,10 @@
 ]).
 
 -export([
-  tuple_to_map/1
+  tuple_to_map/1,
+  % used by epike, the lazy normalization search
+  smallest/3,
+  single/4
 ]).
 
 -define(ATOM, ty_variable).
