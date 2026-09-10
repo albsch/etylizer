@@ -32,22 +32,27 @@ check_all_report(Ctx, FileName, Env, Decls) ->
         fun({Decl, Ty}) ->
             {function, _, Name, Arity, _} = Decl,
             ?METRIC_SET_FUN(list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity]))),
+            ?METRIC_DO(MLabel = list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity]))),
+            ?METRIC_WORK_START(W0),
             T0 = erlang:system_time(millisecond),
             try check_report(ExtCtx, Decl, Ty) of
                 success ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, ok}),
+                    ?METRIC_WORK(typecheck_work, MLabel, W0),
                     io:format(user,"Ok: ~s:~w/~w (~p ms)~n", [F(FileName), Name, Arity, Time]),
                     false;
                 timeout ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, timeout}),
+                    ?METRIC_WORK(typecheck_work, MLabel, W0),
                     io:format(user,"Timeout: ~s:~w/~w (~p ms)~n", [F(FileName), Name, Arity, Time]),
                     {true, {Name, Arity}}
             catch
                 throw:{etylizer, ty_error, Msg} ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, error}),
+                    ?METRIC_WORK(typecheck_work, MLabel, W0),
                     io:format(user,"Error: ~s:~w/~w (~p ms)~n  ~s~n", [F(FileName), Name, Arity, Time, Msg]),
                     {true, {Name, Arity}};
                 throw:{etylizer, unsupported, Msg} ->
@@ -56,11 +61,13 @@ check_all_report(Ctx, FileName, Env, Decls) ->
                 throw:{etylizer, Type, _Msg} ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, error}),
+                    ?METRIC_WORK(typecheck_work, MLabel, W0),
                     io:format(user,"Error: (~p) ~s:~w/~w (~p ms)~n", [Type, F(FileName), Name, Arity, Time]),
                     {true, {Name, Arity}};
                 _:T ->
                     Time = ?TIME(T0),
                     ?METRIC(typecheck_time, {list_to_atom(utils:sformat("~s:~w/~w", [F(FileName), Name, Arity])), Time, error}),
+                    ?METRIC_WORK(typecheck_work, MLabel, W0),
                     io:format(user,"Other: (~p) ~s:~w/~w (~p ms)~n", [{T}, F(FileName), Name, Arity, Time]),
                     {true, {Name, Arity}}
             end

@@ -231,8 +231,10 @@ do_is_satisfiable(SymTab, Constraints, FixedVars) ->
     {false, [{error, string()}]} | {true, term()}.
 do_satisfiable(FinalCons, MonomorphicTallyVariables) ->
     ?METRIC_DO(T0 = erlang:monotonic_time(microsecond)),
+    ?METRIC_WORK_START(W0),
     InternalConstraints = [{ty_parser:parse(T1), ty_parser:parse(T2)} || {T1, T2} <- FinalCons],
     InternalResult = etally:is_tally_satisfiable(InternalConstraints, MonomorphicTallyVariables),
+    ?METRIC_PROBLEM(FinalCons, InternalResult, W0),
     ?METRIC_DO(metrics:record(tally_partition_time, {current_fn(), erlang:monotonic_time(microsecond) - T0})),
     case InternalResult of
         false -> {false, []};
