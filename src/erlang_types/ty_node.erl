@@ -69,7 +69,8 @@
 -define(CACHE, ty_node_cache).
 -define(NORMCACHE, ty_node_normalize_cache).
 -define(OPCACHE, ty_node_op_cache).
--define(ALL_ETS, [?ID, ?SYSTEM, ?P, ?N, ?UNIQUETABLE, ?CACHE, ?NORMCACHE, ?OPCACHE]).
+-define(VARCACHE, ty_node_variables_cache).
+-define(ALL_ETS, [?ID, ?SYSTEM, ?P, ?N, ?UNIQUETABLE, ?CACHE, ?NORMCACHE, ?OPCACHE, ?VARCACHE]).
 -define(TY, dnf_ty_variable).
 
 -spec init() -> _.
@@ -565,9 +566,39 @@ collect_node_refs(Body) ->
     fun(E = {node, Id}) when is_integer(Id) -> {ok, E}; (_) -> error end,
     Body).
 
+%% all_variables/2 threads its visited set *down* the recursion but never across
+%% siblings, and keeps no memo, so a node reachable by k paths is expanded k
+%% times: the cost is exponential in the depth of the node DAG rather than
+%% linear in its size. On the shared unions produced by large symbol tables a
+%% single call does not return in any practical time.
+%%
+%% Walk the DAG here instead, with a real visited set, so every node is expanded
+%% exactly once. A node's own layer is read by handing all_variables/2 a cache
+%% pre-seeded with that node's children: the seed stops the descent exactly at
+%% the children, which this walk then visits itself. Results are memoized in
+%% ETS as well, since substitute/2 asks for them per node.
 -spec all_variables(type()) -> sets:set(variable()).
 all_variables(Ty) ->
-  all_variables(Ty, #{}).
+  case ets:lookup(?VARCACHE, Ty) of
+    [{_, Result}] -> ?assert_type(Result, sets:set(variable()));
+    _ ->
+      Result = collect_variables([Ty], #{}, sets:new()),
+      ets:insert(?VARCACHE, [{Ty, Result}]),
+      Result
+  end.
+
+-spec collect_variables([type()], #{type() => []}, sets:set(variable())) -> sets:set(variable()).
+collect_variables([], _Visited, Acc) -> Acc;
+collect_variables([Node | Rest], Visited, Acc) ->
+  case Visited of
+    #{Node := _} -> collect_variables(Rest, Visited, Acc);
+    _ ->
+      Body = load(Node),
+      Children = collect_node_refs(Body),
+      Seed = maps:from_list([{C, []} || C <- Children]),
+      Own = ?TY:all_variables(Body, Seed),
+      collect_variables(Children ++ Rest, Visited#{Node => []}, sets:union(Own, Acc))
+  end.
 
 -spec all_variables(type(), all_variables_cache()) -> sets:set(variable()).
 all_variables(Ty, Cache) ->

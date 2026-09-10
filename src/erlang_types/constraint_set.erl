@@ -215,6 +215,10 @@ join_var_eq(Var, T1, S1, T2, S2, C1, C2, Fixed) ->
 -spec is_unsatisfiable
   (constraint(), monomorphic_variables()) -> boolean();
   (constraint_set(), monomorphic_variables()) -> boolean().
+is_unsatisfiable({_Var, L, R}, _Fixed) when L =:= R ->
+  % Type nodes are hash-consed, so equal ids are equal types and L\R is empty,
+  % which normalizes to [[]] -- trivially satisfiable, never to [].
+  false;
 is_unsatisfiable({_Var, L, R}, Fixed) -> 
   case ty_node:normalize(ty_node:difference(L, R), Fixed) of 
     [] -> true; 
@@ -231,6 +235,14 @@ has_smaller_constraint(Con, [C | S]) ->
     _ -> has_smaller_constraint(Con, S)
   end.
 
+% leq(X, X) holds without asking the type engine: nodes are hash-consed, so
+% identical ids are identical types. The constraint sets in one disjunction are
+% built by meeting the same base sets, so most of their bounds are literally the
+% same node and this pointer test replaces a difference plus an emptiness check.
+-spec sub(T, T) -> boolean() when T :: ty_node:type().
+sub(X, X) -> true;
+sub(X, Y) -> ty_node:leq(X, Y).
+
 % C1 and C2 are sorted by variable order
 -spec is_smaller(constraint_set(), constraint_set()) -> boolean().
 is_smaller([], _C2) -> true;
@@ -238,7 +250,7 @@ is_smaller(_C1, []) -> false;
 is_smaller(All = [{V1, T1, T2} | C1], [{V2, S1, S2} | C2]) ->
   case ty_variable:compare(V1, V2) of
     eq ->
-      case ty_node:leq(T1, S1) andalso ty_node:leq(S2, T2) of
+      case sub(T1, S1) andalso sub(S2, T2) of
         true -> is_smaller(C1, C2);
         _ -> false
       end;
@@ -253,7 +265,10 @@ is_smaller(All = [{V1, T1, T2} | C1], [{V2, S1, S2} | C2]) ->
 -spec pick_bounds_in_c(constraint_set(), cache()) -> none | constraint().
 pick_bounds_in_c([], _) -> none;
 pick_bounds_in_c([{Var, S, T} | Cs], Memo) ->
-  case (ty_node:is_empty(S) orelse ty_node:leq(ty_node:any(), T)) of
+  % Same idea: the empty lower bound and the any upper bound are consed nodes,
+  % so the common cases are decided by identity before any emptiness check.
+  case (S =:= ty_node:empty() orelse T =:= ty_node:any()
+        orelse ty_node:is_empty(S) orelse ty_node:leq(ty_node:any(), T)) of
     true ->
       pick_bounds_in_c(Cs, Memo);
     false ->
