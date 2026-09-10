@@ -358,8 +358,14 @@ walk_guarded([Sol | Rest], Acc, AccLen, MonoVars, Best) ->
 %% repaid inside its own file by subst:clean_cons/3 (5.04 s -> 3.17 s).
 -spec is_satisfiable_v6(input_constraints(), monomorphic_variables()) -> boolean().
 is_satisfiable_v6(Constraints, MonomorphicVariables) ->
-  % First, normalize and saturate each constraint individually
-  InputSolutions = [tally_saturate(tally_normalize([C], MonomorphicVariables), MonomorphicVariables) || C <- Constraints],
+  % First, normalize and saturate each constraint individually. One memo serves
+  % the whole problem: what the per-constraint saturations learn about bounds
+  % is what the merge asks again.
+  {InputSolutions, Memo} = lists:mapfoldl(
+    fun(C, M0) ->
+      {Normalized, M1} = tally_normalize([C], MonomorphicVariables, M0),
+      tally_saturate(Normalized, MonomorphicVariables, M1)
+    end, constraint_set:memo_new(), Constraints),
 
   case lists:all(fun([[]]) -> true; (_) -> false end, InputSolutions) of
     true -> true;
@@ -372,7 +378,7 @@ is_satisfiable_v6(Constraints, MonomorphicVariables) ->
         true -> false;
         false ->
           Red = [N || N <- InputSolutions, N /= [[]]],
-          merge_pool(build_pool(Red), MonomorphicVariables)
+          merge_pool(build_pool(Red), MonomorphicVariables, Memo)
       end
   end.
 
@@ -410,18 +416,21 @@ solution_variables(Sols) ->
 
 %% The pool is kept sorted by width, so its head is always the cheapest thing to
 %% merge and the walk for a partner stops at the narrowest connected entry.
--spec merge_pool([pool_entry()], monomorphic_variables()) -> boolean().
-merge_pool([], _MonoVars) -> true;
-merge_pool([_Single], _MonoVars) ->
+-spec merge_pool([pool_entry()], monomorphic_variables(), constraint_set:memo()) -> boolean().
+merge_pool([], _MonoVars, _Memo) -> true;
+merge_pool([_Single], _MonoVars, _Memo) ->
   % One entry left and it is not [] -- every merge that produced it was checked
   true;
-merge_pool([{_WidthA, VarsA, SolsA} | Rest], MonoVars) ->
+merge_pool([{_WidthA, VarsA, SolsA} | Rest], MonoVars, Memo0) ->
   {{_WidthB, VarsB, SolsB}, Others} = take_partner(Rest, VarsA),
-  case tally_saturate(constraint_set:meet(SolsA, SolsB, MonoVars), MonoVars) of
-    [] -> false;
-    Merged ->
+  %% Both entries are saturated, so only the constraints the join actually
+  %% merges need expanding; meet_saturate/4 seeds each joined set's saturation
+  %% cache with its parents' bound pairs instead of re-expanding everything.
+  case constraint_set:meet_saturate(SolsA, SolsB, MonoVars, Memo0) of
+    {[], _} -> false;
+    {Merged, Memo1} ->
       Entry = {constraint_set:len(Merged), sets:union(VarsA, VarsB), Merged},
-      merge_pool(insert_by_width(Entry, Others), MonoVars)
+      merge_pool(insert_by_width(Entry, Others), MonoVars, Memo1)
   end.
 
 %% Prefer the narrowest entry that shares a variable with the one being merged;
@@ -463,10 +472,11 @@ tally(Constraints) -> tally(Constraints, #{}).
 
 -spec tally(input_constraints(), monomorphic_variables()) -> {error, []} | tally_solutions().
 tally(Constraints, MonomorphicVariables) ->
+  Memo0 = constraint_set:memo_new(),
   % io:format(user,"~n~n=== Step 1: Normalize ~p constraints~n~s~nFixed variables: ~p~n===~n", [length(Constraints), print(Constraints), MonomorphicVariables]),
-  Normalized = ?TIME(tally_normalize, tally_normalize(Constraints, MonomorphicVariables)),
+  {Normalized, Memo1} = ?TIME(tally_normalize, tally_normalize(Constraints, MonomorphicVariables, Memo0)),
   % io:format(user,"~n~n=== Step 2: Saturate ~p sets~n~s~nFixed variables: ~p~n===~n", [length(Constraints), print(Normalized), MonomorphicVariables]),
-  Saturated = ?TIME(tally_saturate, tally_saturate(Normalized, MonomorphicVariables)),
+  {Saturated, _Memo2} = ?TIME(tally_saturate, tally_saturate(Normalized, MonomorphicVariables, Memo1)),
   % io:format(user,"~n~n=== Step 3: Solve ~p sets~n~s~nFixed variables: ~p~n===~n", [length(Constraints), print(Saturated), MonomorphicVariables]),
   Solved = ?TIME(tally_solve, tally_solve(Saturated, MonomorphicVariables)),
   % io:format(user,"~n~n=== Step 4: Solved~n~p~n===~n", [Solved]),
@@ -478,26 +488,38 @@ tally(Constraints, MonomorphicVariables) ->
 
 -spec tally_normalize(input_constraints(), monomorphic_variables()) -> set_of_constraint_sets().
 tally_normalize(Constraints, MonomorphicVariables) ->
+  {Normalized, _} = tally_normalize(Constraints, MonomorphicVariables, constraint_set:memo_new()),
+  Normalized.
+
+-spec tally_normalize(input_constraints(), monomorphic_variables(), constraint_set:memo()) ->
+    {set_of_constraint_sets(), constraint_set:memo()}.
+tally_normalize(Constraints, MonomorphicVariables, Memo0) ->
   lists:foldl(fun
-    ({_S, _T}, []) -> [];
-    ({S, T}, A) ->
-      SnT = ?TY:difference(S, T),
-      case ty_node:normalize(SnT, MonomorphicVariables) of
+    ({_S, _T}, {[], M}) -> {[], M};
+    ({S, T}, {A, M}) ->
+      case constraint_set:norm(S, T, MonomorphicVariables, M) of
         %% Short-circuit: meet(A, []) = [] — skip the meet call entirely.
-        [] -> [];
-        Normalized -> constraint_set:meet(A, Normalized, MonomorphicVariables)
+        {[], M1} -> {[], M1};
+        {Normalized, M1} -> constraint_set:meet(A, Normalized, MonomorphicVariables, M1)
       end
-              end, [[]], Constraints).
+              end, {[[]], Memo0}, Constraints).
 
 
 -spec tally_saturate(set_of_constraint_sets(), monomorphic_variables()) -> set_of_constraint_sets().
 tally_saturate(Normalized, MonomorphicVariables) ->
+  {Saturated, _} = tally_saturate(Normalized, MonomorphicVariables, constraint_set:memo_new()),
+  Saturated.
+
+-spec tally_saturate(set_of_constraint_sets(), monomorphic_variables(), constraint_set:memo()) ->
+    {set_of_constraint_sets(), constraint_set:memo()}.
+tally_saturate(Normalized, MonomorphicVariables, Memo0) ->
   lists:foldl(
     fun
-      (_ConstraintSet, [[]]) -> [[]];
-      (ConstraintSet, A) ->
-        constraint_set:join(A, constraint_set:saturate(ConstraintSet, MonomorphicVariables, _Cache = #{}), MonomorphicVariables) 
-    end, [], Normalized).
+      (_ConstraintSet, {[[]], M}) -> {[[]], M};
+      (ConstraintSet, {A, M}) ->
+        {Saturated, M1} = constraint_set:saturate(ConstraintSet, MonomorphicVariables, _Cache = #{}, M),
+        constraint_set:join(A, Saturated, MonomorphicVariables, M1)
+    end, {[], Memo0}, Normalized).
 
 -spec tally_solve(set_of_constraint_sets(), monomorphic_variables()) -> {error, []} | tally_solutions().
 tally_solve([], _MonomorphicVariables) -> {error, []};
