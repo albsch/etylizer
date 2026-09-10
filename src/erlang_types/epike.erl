@@ -20,26 +20,28 @@
 %% line) is a decision that pushes its remaining alternatives onto the
 %% trail and backtracks, and a leaf emits ONE one-sided bound -- alpha <=
 %% single(...) or single(...) <= alpha, the NTLV rule -- which is merged
-%% into C on the spot. When the merge tightens an existing bound, the
-%% consequence that saturation would add later is itself an empty goal run
-%% right away: only the *incremental* part CL \ U (resp. L \ CU), never the
-%% accumulated pair. The search succeeds when K is exhausted: every line
-%% consumed, every consequence established, C saturated by construction. It
-%% fails when the trail is: every alternative refuted. The correspondence
-%% with a SAT solver:
+%% into C on the spot. A variable's bounds are kept as the pieces that were
+%% merged into them; a new piece is checked against every piece on the
+%% other side, since
+%% (L1 | L2) \ (U1 & U2) = L1 \ U1 | L1 \ U2 | L2 \ U1 | L2 \ U2, and each
+%% pair is an empty goal run right away: the consequence that saturation
+%% would add later, one piece pair at a time. The search succeeds when K is
+%% exhausted: every line consumed, every consequence established, C
+%% saturated by construction. It fails when the trail is: every alternative
+%% refuted. The correspondence with a SAT solver:
 %%
 %%   partial assignment      the bound map C : variable -> {Lower, Upper}
 %%   literal                 one one-sided bound from the NTLV rule
 %%   decision                an OR of the tuple or function decomposition
-%%   theory propagation      the consequence goal of a tightened pair
+%%   theory propagation      the consequence goal of a new piece pair
 %%   conflict                a leaf that cannot be made empty under C
 %%   conflict analysis       the reason set of a failure: the decisions the
-%%                           bounds it read depend on
+%%                           pieces it read depend on
 %%   backjumping             a decision that a failure does not depend on
 %%                           does not try its other alternatives
-%%   learning                a goal that failed on its own, under the bounds
-%%                           it read, fails at once wherever those bounds
-%%                           are the same
+%%   learning                a goal that failed on its own, under the pieces
+%%                           it read, fails at once wherever those pieces
+%%                           are present
 %%   model                   K exhausted
 %%
 %% The engine. Goals are data, and the search is three mutually
@@ -64,65 +66,74 @@
 %% next alternative starts from them; K is a list, shared by every
 %% alternative.
 %%
-%% The reasons are what makes the search tractable where normalize is: a
-%% tuple or function decomposition has many independent decisions, and a
-%% later constraint that fails for reasons of its own must not make the
-%% search enumerate their product. Every bound piece carries the decisions
-%% it depends on (the path of decisions above the leaf that emitted it), a
-%% consequence goal inherits the reasons of both pieces it relates, a ground
-%% leaf that cannot be made empty fails with the reasons of its goal, and a
-%% decision whose alternative fails for a reason it is not part of fails
-%% with that reason at once.
+%% Reasons. Every piece carries the decisions it depends on (the decisions
+%% above the leaf that emitted it), a consequence goal inherits the reasons
+%% of the two pieces it relates, a ground leaf that cannot be made empty
+%% fails with the reasons of its goal, and a decision whose alternative
+%% fails for a reason it is not part of fails with that reason at once: no
+%% piece the decision produced was read by the failure, so the same failure
+%% exists under every alternative.
 %%
-%% Learning is what makes the search not repeat itself across branches.
-%% Every activation of empty(T) records the bounds it reads, first read
-%% wins, and a failure carries the reads that led to it. When an activation
-%% fails without ever having exited, T could not be made empty by itself
-%% under those reads, whatever the rest of the problem: the pair {T, reads}
-%% is a nogood. Nogoods are sound under tighter bounds (a failure under
-%% looser bounds is a failure under tighter ones) and are reused on exact
-%% matches. The store travels with the search state and comes back in
-%% failures, so what a failed branch learned is known to every later one.
+%% Learning. Every activation of empty(T) records the pieces it reads, a
+%% failure carries the reads that led to it, and a tag on the trail, pushed
+%% when the activation exits, tells a local failure from one of the rest of
+%% the search. When an activation fails without ever having exited, T
+%% could not be made empty by itself given the pieces it read that existed
+%% before it started (its own pieces it would make again): {T, those pieces}
+%% is a nogood. Everything a search does depends on C only through the
+%% pieces its consequences pair up, so the nogood holds wherever those
+%% pieces are present, and a hit fails with exactly their current reasons
+%% plus the path of the goal. Pieces are numbered by an epoch on the path to
+%% tell an activation's own pieces from the ones it found. The store travels
+%% in the search state and comes back in failures, so what a failed branch
+%% learned is known to every later one.
 %%
 %% The coinductive hypotheses of the emptiness algorithm and the goals
 %% already achieved on the current path live in X, threaded in the search
 %% state along K: a recursive type met again is assumed empty, and a
 %% sub-goal met again on the same path is skipped since its bounds are
-%% already in C. Backtracking discards X with the path.
+%% already in C. Backtracking discards X, the epoch and the reads with the
+%% path.
 %%
 %% Piking searches exactly the tree normalize + saturate materialize:
 %% the same minimized lines, the same singled bounds, the same
 %% decompositions, with prunings that lose no answer. A goal achieved on the
 %% path is not redone (C already lies inside it, the other alternatives only
 %% tighten C, and any leaf below a tighter set has a solution that also
-%% satisfies C and the pending goals). The consequence of a tightened pair is
-%% its incremental part: every pair (lower piece, upper piece) is covered
-%% when the later of the two arrives. A backjump skips alternatives only
-%% when the failure read no bound that the decision produced, so the same
-%% failure exists under every alternative. And a nogood is reused only where
-%% every bound it read has the same value.
+%% satisfies C and the pending goals). Skipping an achieved or in-progress
+%% goal, or a consequence already implied, only weakens a search, so a
+%% failure found with skips holds without them, and a failure under fewer
+%% pieces holds under more.
 
 -export([is_satisfiable/2]).
 
 -include("constraints.hrl").
 
 -type input_constraints() :: [{ty:type(), ty:type()}].
-%% The decisions a bound piece, a goal or a failure depends on.
+%% The decisions a piece, a goal or a failure depends on.
 -type reason() :: #{integer() => []}.
-%% C: the bounds of every variable constrained so far, each side with the
-%% decisions its pieces depend on.
--type bounds() :: #{variable() => {ty:type(), ty:type(), reason(), reason()}}.
+%% Pieces are numbered in the order they are made on the path.
+-type epoch() :: non_neg_integer().
+%% One bound emitted for a variable: the node, the decisions it depends on,
+%% and its epoch.
+-type piece() :: {ty:type(), reason(), epoch()}.
+%% C: the bounds of every variable constrained so far, merged and as pieces:
+%% the lower bound is the union of the lower pieces, the upper bound the
+%% intersection of the upper pieces.
+-type bounds() :: #{variable() => {ty:type(), ty:type(), [piece()], [piece()]}}.
 %% X: goals achieved or assumed on the current path. {node, T} is added when
 %% empty(T) starts (coinductive hypothesis) and stays; phi and explore keys
 %% are added when the sub-goal completes.
 -type achieved() :: #{term() => []}.
-%% The bounds an activation has read, first read wins.
--type reads() :: #{variable() => {ty:type(), ty:type()}}.
+%% The pieces an activation has read, with their epochs.
+-type read() :: {variable(), lower | upper, ty:type()}.
+-type reads() :: #{read() => epoch()}.
 %% Nogoods: the read sets under which empty(T) failed on its own.
 -type store() :: #{ty:type() => [reads()]}.
 -record(s, {
   c :: bounds(),
   x :: achieved(),
+  epoch :: epoch(),
   reads :: reads(),
   store :: store()
 }).
@@ -130,6 +141,7 @@
 
 %% A goal.
 -type goal() :: {empty, ty:type()}                             % make the node empty
+              | {consequence, ty:type(), reason(), read(), epoch()} % a piece pair, reading one of them
               | {line, {[variable()], [variable()], ty_rec:type()}} % a DNF line of a node
               | {all, [goal()]}                                % a conjunction
               | {phi, [ty:type()], [ty_tuple:type()]}
@@ -143,7 +155,7 @@
 %% The trail: what a failure meets on its way back, innermost first.
 -type handler() :: {decide, [goal()], s(), k(), reason(), integer(), reason(), reads()} % a decision: alternatives left, its state
                  | {tag, integer()}                                   % an activation exited: its continuation failed
-                 | {activation, ty:type(), integer(), reads()}.       % an activation started: learn its nogood
+                 | {activation, ty:type(), integer(), epoch(), reads()}. % an activation started: learn its nogood
 -type trail() :: [handler()].
 
 -define(NOGOODS_PER_NODE, 32).
@@ -157,7 +169,7 @@
 is_satisfiable(Constraints, Fixed) ->
   Env = #env{fixed = Fixed},
   Goals = [{empty, ty_node:difference(S, T)} || {S, T} <- Constraints],
-  S0 = #s{c = #{}, x = #{}, reads = #{}, store = #{}},
+  S0 = #s{c = #{}, x = #{}, epoch = 0, reads = #{}, store = #{}},
   all_of(Goals, S0, [], [], #{}, Env).
 
 %% --- the engine -------------------------------------------------------------
@@ -166,6 +178,8 @@ is_satisfiable(Constraints, Fixed) ->
 -spec goal(goal(), s(), k(), trail(), reason(), env()) -> boolean().
 goal({empty, T}, S, K, Tr, Path, Env) ->
   empty(T, S, K, Tr, Path, Env);
+goal({consequence, T, Path, Read, Epoch}, S = #s{reads = Reads}, K, Tr, _Path, Env) ->
+  empty(T, S#s{reads = Reads#{Read => Epoch}}, K, Tr, Path, Env);
 goal({all, Goals}, S, K, Tr, Path, Env) ->
   all_of(Goals, S, K, Tr, Path, Env);
 goal({phi, BigS, Neg}, S, K, Tr, Path, Env) ->
@@ -190,7 +204,7 @@ ret(S, [{conj, Goals, Path} | K], Tr, Env) ->
 ret(S = #s{reads = ReadsIn}, [{exit, Reads0, Tok} | K], Tr, Env) ->
   % the activation hands its reads on; from here on a failure is one of
   % the rest of the search, which the tag tells its activation
-  ret(S#s{reads = merge_reads(Reads0, ReadsIn)}, K, [{tag, Tok} | Tr], Env);
+  ret(S#s{reads = maps:merge(Reads0, ReadsIn)}, K, [{tag, Tok} | Tr], Env);
 ret(S = #s{x = X}, [{achieve, Key} | K], Tr, Env) ->
   ret(S#s{x = X#{Key => []}}, K, Tr, Env).
 
@@ -207,18 +221,19 @@ fail(_R, _Reads, _Store, [], _Env) -> false;
 fail(R, Reads, Store, [{decide, Goals, S, K, Path, D, Acc, ReadsAcc} | Tr], Env) ->
   case R of
     #{D := _} ->
-      decide(Goals, S#s{store = Store}, K, Tr, Path, D, maps:merge(Acc, R), merge_reads(ReadsAcc, Reads), Env);
+      decide(Goals, S#s{store = Store}, K, Tr, Path, D, maps:merge(Acc, R), maps:merge(ReadsAcc, Reads), Env);
     _ ->
       fail(R, Reads, Store, Tr, Env)
   end;
 fail(R, Reads, Store, [{tag, Tok} | Tr], Env) ->
   fail(R#{Tok => []}, Reads, Store, Tr, Env);
-fail(R, ReadsIn, Store, [{activation, T, Tok, Reads0} | Tr], Env) ->
+fail(R, ReadsIn, Store, [{activation, T, Tok, E0, Reads0} | Tr], Env) ->
   case R of
     #{Tok := _} ->
       fail(maps:remove(Tok, R), ReadsIn, Store, Tr, Env);
     _ ->
-      fail(R, merge_reads(Reads0, ReadsIn), learn(T, ReadsIn, Store), Tr, Env)
+      Found = maps:filter(fun(_, E) -> E < E0 end, ReadsIn),
+      fail(R, maps:merge(Reads0, ReadsIn), learn(T, Found, Store), Tr, Env)
   end.
 
 %% A conjunction: each goal runs with the rest of the conjunction on K, so a
@@ -252,20 +267,20 @@ decide([G | Gs], S, K, Tr, Path, D, Acc, Reads, Env) ->
 
 %% Make the node T empty under C. One activation: it reads into a fresh read
 %% set, hands its reads on when it exits, and if it fails before it ever
-%% exited, {T, reads} is learned.
+%% exited, {T, the pieces it read that predate it} is learned.
 -spec empty(ty:type(), s(), k(), trail(), reason(), env()) -> boolean().
-empty(T, S = #s{c = C, x = X, reads = Reads0, store = Store0}, K, Tr, Path, Env = #env{fixed = Fixed}) ->
+empty(T, S = #s{c = C, x = X, epoch = E0, reads = Reads0, store = Store0}, K, Tr, Path, Env = #env{fixed = Fixed}) ->
   case X of
     #{{node, T} := _} -> ret(S, K, Tr, Env);
     _ ->
-      Lines = ground_first(dnf_ty_variable:minimize_dnf(ty_node:load(T)), Fixed),
-      case known_failure(T, C, Store0, Env) of
-        {true, Reads} ->
-          fail(maps:merge(Path, reason_of(Reads, C)), merge_reads(Reads0, Reads), Store0, Tr, Env);
+      case known_failure(T, C, Store0) of
+        {true, Reads, Reason} ->
+          fail(maps:merge(Path, Reason), maps:merge(Reads0, Reads), Store0, Tr, Env);
         false ->
           Tok = erlang:unique_integer([positive]),
+          Lines = ground_first(dnf_ty_variable:minimize_dnf(ty_node:load(T)), Fixed),
           all_of([{line, L} || L <- Lines], S#s{x = X#{{node, T} => []}, reads = #{}},
-                 [{exit, Reads0, Tok} | K], [{activation, T, Tok, Reads0} | Tr], Path, Env)
+                 [{exit, Reads0, Tok} | K], [{activation, T, Tok, E0, Reads0} | Tr], Path, Env)
       end
   end.
 
@@ -296,109 +311,86 @@ line({P, N, Leaf}, S, K, Tr, Path, Env = #env{fixed = Fixed}) ->
       leaf_empty(Leaf, S, K, Tr, Path, Env)
   end.
 
-%% alpha <= U, a piece depending on Path. Tightening an existing upper bound
-%% obliges the lower bound to fit under the new piece: CL <= U, an empty goal
-%% on CL \ U that depends on both pieces' reasons. Both current bounds are
-%% read.
+%% alpha <= U, a piece depending on Path. A piece the current upper bound
+%% already implies changes nothing. Otherwise every lower piece must fit
+%% under the new one: one consequence per pair, each reading the lower piece.
 -spec bound_upper(variable(), ty:type(), s(), k(), trail(), reason(), env()) -> boolean().
-bound_upper(V, U, S = #s{c = C, reads = Reads}, K, Tr, Path, Env) ->
+bound_upper(V, U, S = #s{c = C, epoch = E}, K, Tr, Path, Env) ->
   Empty = ty_node:empty(),
-  Any = ty_node:any(),
   case C of
-    #{V := {CL, CU, RL, RU}} ->
-      S1 = S#s{reads = read(V, CL, CU, Reads)},
+    #{V := {CL, CU, Ls, Us}} ->
       case intersect_bound(U, CU, Env) of
-        CU -> ret(S1, K, Tr, Env);
+        CU -> ret(S, K, Tr, Env);
         U1 ->
-          S2 = S1#s{c = C#{V := {CL, U1, RL, maps:merge(RU, Path)}}},
-          case CL of
-            Empty -> ret(S2, K, Tr, Env);
-            _ ->
-              empty(ty_node:difference(CL, U), S2, K, Tr, maps:merge(RL, Path), Env)
-          end
+          S1 = S#s{c = C#{V := {CL, U1, Ls, [{U, Path, E} | Us]}}, epoch = E + 1},
+          consequences([{ty_node:difference(L, U), maps:merge(RL, Path), {V, lower, L}, EL}
+                        || {L, RL, EL} <- Ls], S1, K, Tr, Env)
       end;
     _ ->
-      ret(S#s{c = C#{V => {Empty, U, #{}, Path}}, reads = read(V, Empty, Any, Reads)}, K, Tr, Env)
+      ret(S#s{c = C#{V => {Empty, U, [], [{U, Path, E}]}}, epoch = E + 1}, K, Tr, Env)
   end.
 
-%% L <= alpha, symmetric: the new lower piece must fit under the upper bound.
+%% L <= alpha, symmetric: the new lower piece must fit under every upper piece.
 -spec bound_lower(variable(), ty:type(), s(), k(), trail(), reason(), env()) -> boolean().
-bound_lower(V, L, S = #s{c = C, reads = Reads}, K, Tr, Path, Env) ->
-  Empty = ty_node:empty(),
+bound_lower(V, L, S = #s{c = C, epoch = E}, K, Tr, Path, Env) ->
   Any = ty_node:any(),
   case C of
-    #{V := {CL, CU, RL, RU}} ->
-      S1 = S#s{reads = read(V, CL, CU, Reads)},
+    #{V := {CL, CU, Ls, Us}} ->
       case union_bound(L, CL, Env) of
-        CL -> ret(S1, K, Tr, Env);
+        CL -> ret(S, K, Tr, Env);
         L1 ->
-          S2 = S1#s{c = C#{V := {L1, CU, maps:merge(RL, Path), RU}}},
-          case CU of
-            Any -> ret(S2, K, Tr, Env);
-            _ ->
-              empty(ty_node:difference(L, CU), S2, K, Tr, maps:merge(RU, Path), Env)
-          end
+          S1 = S#s{c = C#{V := {L1, CU, [{L, Path, E} | Ls], Us}}, epoch = E + 1},
+          consequences([{ty_node:difference(L, U), maps:merge(RU, Path), {V, upper, U}, EU}
+                        || {U, RU, EU} <- Us], S1, K, Tr, Env)
       end;
     _ ->
-      ret(S#s{c = C#{V => {L, Any, Path, #{}}}, reads = read(V, Empty, Any, Reads)}, K, Tr, Env)
+      ret(S#s{c = C#{V => {L, Any, [{L, Path, E}], []}}, epoch = E + 1}, K, Tr, Env)
   end.
+
+%% The consequences of a new piece: for every piece on the other side, the
+%% pair must satisfy lower <= upper. Each is an empty goal under the two
+%% pieces' reasons, and reads the piece it was paired with.
+-spec consequences([{ty:type(), reason(), read(), epoch()}], s(), k(), trail(), env()) -> boolean().
+consequences(Pairs, S, K, Tr, Env) ->
+  all_of([{consequence, T, Path, Read, Epoch} || {T, Path, Read, Epoch} <- Pairs], S, K, Tr, #{}, Env).
 
 %% --- learning ---------------------------------------------------------------
-
-
-%% First read wins: the value an activation saw first is the one its
-%% outcome depends on; later, tighter values are its own doing.
--spec read(variable(), ty:type(), ty:type(), reads()) -> reads().
-read(V, L, U, Reads) ->
-  case Reads of
-    #{V := _} -> Reads;
-    _ -> Reads#{V => {L, U}}
-  end.
-
-%% The reads of an enclosing activation, extended by those of a nested one.
--spec merge_reads(reads(), reads()) -> reads().
-merge_reads(Older, Newer) -> maps:merge(Newer, Older).
 
 -spec learn(ty:type(), reads(), store()) -> store().
 learn(T, Reads, Store) ->
   Known = maps:get(T, Store, []),
   Store#{T => lists:sublist([Reads | Known], ?NOGOODS_PER_NODE)}.
 
-%% A nogood applies when every bound it read has the same value now.
--spec known_failure(ty:type(), bounds(), store(), env()) -> false | {true, reads()}.
-known_failure(T, C, Store, _Env) ->
-  Empty = ty_node:empty(),
-  Any = ty_node:any(),
+%% A nogood applies when every piece it read is present. Its reads come back
+%% with the pieces' current epochs, and its reason is the pieces' current
+%% reasons.
+-spec known_failure(ty:type(), bounds(), store()) -> false | {true, reads(), reason()}.
+known_failure(T, C, Store) ->
   case Store of
-    #{T := Nogoods} ->
-      Matches = fun(Reads) ->
-        lists:all(
-          fun({V, {L, U}}) ->
-            case C of
-              #{V := {CL, CU, _, _}} -> CL =:= L andalso CU =:= U;
-              _ -> L =:= Empty andalso U =:= Any
-            end
-          end, maps:to_list(Reads))
-      end,
-      case lists:search(Matches, Nogoods) of
-        {value, Reads} -> {true, Reads};
+    #{T := Known} -> match_nogoods(Known, C);
+    _ -> false
+  end.
+
+-spec match_nogoods([reads()], bounds()) -> false | {true, reads(), reason()}.
+match_nogoods([], _C) -> false;
+match_nogoods([Reads | Rest], C) ->
+  case present(maps:keys(Reads), C, #{}, #{}) of
+    {true, Current, Reason} -> {true, Current, Reason};
+    false -> match_nogoods(Rest, C)
+  end.
+
+-spec present([read()], bounds(), reads(), reason()) -> false | {true, reads(), reason()}.
+present([], _C, Current, Reason) -> {true, Current, Reason};
+present([Read = {V, Side, Node} | Rest], C, Current, Reason) ->
+  case C of
+    #{V := {_, _, Ls, Us}} ->
+      Pieces = case Side of lower -> Ls; upper -> Us end,
+      case lists:keyfind(Node, 1, Pieces) of
+        {Node, R, E} -> present(Rest, C, Current#{Read => E}, maps:merge(Reason, R));
         false -> false
       end;
     _ -> false
   end.
-
-%% The decisions the current values of the read bounds depend on. A hit adds
-%% the path of the goal itself: the failure also depends on the decisions
-%% that posed the goal.
--spec reason_of(reads(), bounds()) -> reason().
-reason_of(Reads, C) ->
-  maps:fold(
-    fun(V, _, Acc) ->
-      case C of
-        #{V := {_, _, RL, RU}} -> maps:merge(Acc, maps:merge(RL, RU));
-        _ -> Acc
-      end
-    end, #{}, Reads).
 
 %% --- the leaf level ---------------------------------------------------------
 
@@ -489,7 +481,7 @@ replace_at(I, [H | T], NComp) -> [H | replace_at(I - 1, T, NComp)].
 
 %% One line of a function DNF, as dnf_ty_function:normalize_line: some
 %% negative arrow T1 -> T2 refutes the intersection of the positive arrows,
-%% which needs T1 inside the union S of the domains and explore to hold.
+%% which needs T1 inside the union of the domains and explore to hold.
 %% Which negative arrow is one decision.
 -spec function_line(function_dnf_line(), s(), k(), trail(), reason(), env()) -> boolean().
 function_line({Pos, Neg, _}, S, K, Tr, Path, Env) ->
@@ -505,9 +497,7 @@ function_line({Pos, Neg, _}, S, K, Tr, Path, Env) ->
 %% positive arrow S1 -> S2 is split off on both sides. One decision, unless
 %% T1 or T2 is already empty on this path.
 -spec explore(ty:type(), ty:type(), [ty_function:type()], s(), k(), trail(), reason(), env()) -> boolean().
-explore(T1, T2, [], S, K, Tr, Path, Env) ->
-  any_of([{empty, T1}, {empty, T2}], S, K, Tr, Path, Env);
-explore(T1, T2, P = [F | Ps], S = #s{x = X}, K, Tr, Path, Env) ->
+explore(T1, T2, P, S = #s{x = X}, K, Tr, Path, Env) ->
   Key = {explore, T1, T2, P},
   case X of
     #{Key := _} -> ret(S, K, Tr, Env);
@@ -515,13 +505,15 @@ explore(T1, T2, P = [F | Ps], S = #s{x = X}, K, Tr, Path, Env) ->
       case maps:is_key({node, T1}, X) orelse maps:is_key({node, T2}, X) of
         true -> ret(S#s{x = X#{Key => []}}, K, Tr, Env);
         false ->
-          S1 = ty_function:domain(F),
-          S2 = ty_function:codomain(F),
-          any_of([{empty, T1},
-                  {empty, T2},
-                  {all, [{explore, T1, ty_node:intersect(T2, S2), Ps},
-                         {explore, ty_node:difference(T1, S1), T2, Ps}]}],
-                 S, [{achieve, Key} | K], Tr, Path, Env)
+          Split = case P of
+            [] -> [];
+            [F | Ps] ->
+              S1 = ty_function:domain(F),
+              S2 = ty_function:codomain(F),
+              [{all, [{explore, T1, ty_node:intersect(T2, S2), Ps},
+                      {explore, ty_node:difference(T1, S1), T2, Ps}]}]
+          end,
+          any_of([{empty, T1}, {empty, T2} | Split], S, [{achieve, Key} | K], Tr, Path, Env)
       end
   end.
 
