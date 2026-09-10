@@ -106,12 +106,14 @@
 %% The pieces an activation has read, with their epochs.
 -type read() :: {variable(), lower | upper, ty:type()}.
 -type reads() :: #{read() => epoch()}.
-%% What the search has learned. Nogoods: the read sets under which empty(T)
-%% failed on its own. Continuation nogoods, per activation: the read sets
-%% under which the rest of a conjunction from a given position failed.
--type store() :: #{ty:type() => [reads()]}.
--type conts() :: #{integer() => #{term() => [reads()]}}.
--record(learned, {nogoods :: store(), conts :: conts()}).
+%% What the search has learned. Nogoods -- the read sets under which
+%% empty(T) failed on its own -- are statements about types, valid in every
+%% problem with the same monomorphic variables, and live in the engine's
+%% caches (ty_node:nogoods/2, learn_nogood/3). Continuation nogoods, per
+%% activation: the read sets under which the rest of a conjunction from a
+%% given position failed.
+-type conts() :: #{integer() => #{term() => [{epoch(), reads()}]}}.
+-record(learned, {conts :: conts()}).
 -type learned() :: #learned{}.
 -record(s, {
   c :: bounds(),
@@ -130,7 +132,7 @@
 %% A goal runs under the decisions its existence depends on.
 -type goal() :: fun((s(), k(), reason()) -> result()).
 
--define(NOGOODS_PER_NODE, 32).
+-define(NOGOODS_PER_NODE, 32). % continuation nogoods per position
 
 -record(env, {
   fixed :: monomorphic_variables(),
@@ -150,7 +152,7 @@ is_satisfiable(Constraints, Fixed) ->
   Goals = [fun(S, K, _P) -> empty(ty_node:difference(A, B), S, K, #{{input, I} => []}, Env) end
            || {I, {A, B}} <- lists:enumerate(Constraints)],
   S0 = #s{c = #{}, x = #{}, epoch = 0, reads = #{}, tok = 0,
-          learned = #learned{nogoods = #{}, conts = #{}}},
+          learned = #learned{conts = #{}}},
   Result = case all_of(inputs, Goals, S0, fun(_S) -> true end, #{}) of
     true -> true;
     {false, _Reason, _Reads, _Learned} -> false
@@ -182,8 +184,9 @@ all_from(Pos = {Id, I}, [G | Gs], S = #s{c = C, epoch = E, reads = Reads0, tok =
       case G(S, fun(S1) -> all_from({Id, I + 1}, Gs, S1, K, Path) end, Path) of
         true -> true;
         {false, R, ReadsF, Learned1} ->
-          Found = maps:filter(fun(_, Ep) -> Ep < E end, ReadsF),
-          {false, R, ReadsF, learn_cont(Tok, Pos, Found, Learned1)}
+          % the reads are stored as they are with the epoch of the position;
+          % the pieces made after it are skipped when the nogood is matched
+          {false, R, ReadsF, learn_cont(Tok, Pos, {E, ReadsF}, Learned1)}
       end
   end.
 
@@ -233,6 +236,8 @@ all_goal(Id, Goals) -> fun(S, K, Path) -> all_of(Id, Goals, S, K, Path) end.
 %% set, hands its reads on to the continuation, and if it fails before the
 %% continuation ever ran, {T, the pieces it read that predate it} is learned.
 -spec empty(ty:type(), s(), k(), reason(), env()) -> result().
+empty(Empty, S, K, _Path, #env{empty = Empty}) -> K(S);
+empty(Any, #s{reads = Reads, learned = Learned}, _K, Path, #env{any = Any}) -> {false, Path, Reads, Learned};
 empty(T, S = #s{c = C, x = X, epoch = E0, reads = Reads0, tok = Tok0, learned = Learned0}, K, Path, Env = #env{fixed = Fixed}) ->
   case X of
     #{{node, T} := _} -> K(S);
@@ -245,7 +250,7 @@ empty(T, S = #s{c = C, x = X, epoch = E0, reads = Reads0, tok = Tok0, learned = 
             false -> {false, Path, Reads0, Learned0}
           end;
         false ->
-          case known_failure(T, C, Learned0) of
+          case known_failure(T, Fixed, C) of
             {true, Reads, Reason} ->
               bump(learned),
               {false, maps:merge(Path, Reason), maps:merge(Reads0, Reads), Learned0};
@@ -253,13 +258,14 @@ empty(T, S = #s{c = C, x = X, epoch = E0, reads = Reads0, tok = Tok0, learned = 
               bump(nodes),
               Tok = erlang:unique_integer([positive]),
               K1 = fun(S1 = #s{reads = ReadsIn}) ->
-                     case K(S1#s{reads = maps:merge(Reads0, ReadsIn), tok = Tok0}) of
+                     Reads1 = case map_size(ReadsIn) of 0 -> Reads0; _ -> maps:merge(Reads0, ReadsIn) end,
+                     case K(S1#s{reads = Reads1, tok = Tok0}) of
                        true -> true;
                        {false, R, Rd, Ld} -> {false, R#{Tok => []}, Rd, Ld}
                      end
                    end,
-              Lines = ground_first(dnf_ty_variable:minimize_dnf(ty_node:load(T)), Fixed),
-              Goals = [fun(S1, K2, P1) -> line(L, S1, K2, P1, Env) end || L <- Lines],
+              Prepared = ty_node:cached({pike_lines, T, Fixed}, fun() -> prepare(ty_node:lines(T), Fixed) end),
+              Goals = [fun(S1, K2, P1) -> line(L, S1, K2, P1, Env) end || L <- Prepared],
               case all_of({lines, T}, Goals, S#s{x = X#{{node, T} => []}, reads = #{}, tok = Tok}, K1, Path) of
                 true -> true;
                 {false, R, ReadsIn, Ld} ->
@@ -270,46 +276,51 @@ empty(T, S = #s{c = C, x = X, epoch = E0, reads = Reads0, tok = Tok0, learned = 
                     _ ->
                       bump(nogoods),
                       Found = maps:filter(fun(_, E) -> E < E0 end, ReadsIn),
-                      {false, R, maps:merge(Reads0, ReadsIn), learn(T, Found, Ld1)}
+                      ty_node:learn_nogood(T, Fixed, Found),
+                      {false, R, maps:merge(Reads0, ReadsIn), Ld1}
                   end
               end
           end
       end
   end.
 
-%% Lines without a polymorphic variable go first: they are the only ones that
-%% can fail on their own, and a variable line only emits a bound.
--spec ground_first([L], monomorphic_variables()) -> [L] when L :: {[variable()], [variable()], ty_rec:type()}.
-ground_first(Lines, Fixed) ->
-  {Ground, Poly} = lists:partition(
-    fun({P, N, _}) -> lists:all(fun(V) -> maps:is_key(V, Fixed) end, P ++ N) end, Lines),
-  Ground ++ Poly.
+%% The lines of a node, prepared once per node and set of monomorphic
+%% variables: a line with a polymorphic variable is its one-sided bound by
+%% the NTLV rule -- the smallest such variable singled out against the rest
+%% of the line -- and a line without one is its leaf, whose monomorphic
+%% variables are eliminated (Part 1, Lemma C.3/C.11). Leaves go first: they
+%% are the only lines that can fail on their own.
+-type prepared() :: {leaf, ty_rec:type()} | {upper, variable(), ty:type()} | {lower, variable(), ty:type()}.
+-spec prepare([{[variable()], [variable()], ty_rec:type()}], monomorphic_variables()) -> [prepared()].
+prepare(Lines, Fixed) ->
+  Prepared = [prepare_line(L, Fixed) || L <- Lines],
+  {Leaves, Bounds} = lists:partition(fun({leaf, _}) -> true; (_) -> false end, Prepared),
+  Leaves ++ Bounds.
+
+-spec prepare_line({[variable()], [variable()], ty_rec:type()}, monomorphic_variables()) -> prepared().
+prepare_line({[], [], Leaf}, _Fixed) -> {leaf, Leaf};
+prepare_line({P, N, Leaf}, Fixed) ->
+  case dnf_ty_variable:smallest(P, N, Fixed) of
+    {{pos, V}, _} -> {upper, V, ty_node:make(dnf_ty_variable:single(true, P -- [V], N, Leaf))};
+    {{neg, V}, _} -> {lower, V, ty_node:make(dnf_ty_variable:single(false, P, N -- [V], Leaf))};
+    {{{delta, _}, _}, _} -> {leaf, Leaf}
+  end.
 
 %% A type all of whose variables are monomorphic is a constant for tallying:
 %% the subtyping engine decides it, treating those variables as atoms exactly
 %% as the delta rule of normalize_line does.
 -spec is_ground(ty:type(), monomorphic_variables()) -> boolean().
+is_ground(T, Fixed) when map_size(Fixed) =:= 0 ->
+  sets:is_empty(ty_node:all_variables(T));
 is_ground(T, Fixed) ->
   lists:all(fun(V) -> maps:is_key(V, Fixed) end, sets:to_list(ty_node:all_variables(T))).
 
-%% One DNF line of the variable BDD: alpha_1 & .. & !beta_1 & .. & Leaf <= 0.
-%% The NTLV rule singles out the smallest polymorphic variable into one
-%% one-sided bound; a line without one is the leaf's problem.
--spec line({[variable()], [variable()], ty_rec:type()}, s(), k(), reason(), env()) -> result().
-line({[], [], Leaf}, S, K, Path, Env) ->
-  leaf_empty(Leaf, S, K, Path, Env);
-line({P, N, Leaf}, S, K, Path, Env = #env{fixed = Fixed}) ->
-  case dnf_ty_variable:smallest(P, N, Fixed) of
-    {{pos, V}, _} ->
-      U = ty_node:make(dnf_ty_variable:single(true, P -- [V], N, Leaf)),
-      bound_upper(V, U, S, K, Path, Env);
-    {{neg, V}, _} ->
-      L = ty_node:make(dnf_ty_variable:single(false, P, N -- [V], Leaf)),
-      bound_lower(V, L, S, K, Path, Env);
-    {{{delta, _}, _}, _} ->
-      % only monomorphic variables: they are eliminated (Part 1, Lemma C.3/C.11)
-      leaf_empty(Leaf, S, K, Path, Env)
-  end.
+%% One prepared line: alpha_1 & .. & !beta_1 & .. & Leaf <= 0 is a bound on
+%% its smallest polymorphic variable, or its leaf's problem.
+-spec line(prepared(), s(), k(), reason(), env()) -> result().
+line({leaf, Leaf}, S, K, Path, Env) -> leaf_empty(Leaf, S, K, Path, Env);
+line({upper, V, U}, S, K, Path, Env) -> bound_upper(V, U, S, K, Path, Env);
+line({lower, V, L}, S, K, Path, Env) -> bound_lower(V, L, S, K, Path, Env).
 
 %% alpha <= U, a piece depending on Path. A piece the current upper bound
 %% already implies changes nothing. Otherwise every lower piece must fit
@@ -351,25 +362,27 @@ bound_lower(V, L, S = #s{c = C, epoch = E}, K, Path, Env = #env{empty = Empty, a
 %% pair must satisfy lower <= upper. Each is an empty goal under the two
 %% pieces' reasons, and reads the piece it was paired with.
 -spec consequences(term(), [{ty:type(), reason(), read(), epoch()}], s(), k(), env()) -> result().
-consequences(Id, Pairs, S, K, Env) ->
+consequences(Id, Pairs, S, K, Env = #env{empty = Empty}) ->
+  % a pair whose difference is the empty node holds by itself: no goal, no read
   Goals = [fun(S0 = #s{reads = Reads}, K0, _P) ->
              bump(consequences),
              empty(T, S0#s{reads = Reads#{Read => Epoch}}, K0, Path, Env)
-           end || {T, Path, Read, Epoch} <- Pairs],
-  all_of(Id, Goals, S, K, #{}).
+           end || {T, Path, Read, Epoch} <- Pairs, T =/= Empty],
+  case Goals of
+    [] -> K(S);
+    _ -> all_of(Id, Goals, S, K, #{})
+  end.
 
 %% --- learning ---------------------------------------------------------------
 
--spec learn(ty:type(), reads(), learned()) -> learned().
-learn(T, Reads, Learned = #learned{nogoods = Store}) ->
-  Known = maps:get(T, Store, []),
-  Learned#learned{nogoods = Store#{T => lists:sublist([Reads | Known], ?NOGOODS_PER_NODE)}}.
-
--spec learn_cont(integer(), {term(), pos_integer()}, reads(), learned()) -> learned().
-learn_cont(Tok, Pos, Reads, Learned = #learned{conts = Conts}) ->
+-spec learn_cont(integer(), {term(), pos_integer()}, {epoch(), reads()}, learned()) -> learned().
+learn_cont(Tok, Pos, Entry, Learned = #learned{conts = Conts}) ->
   Mine = maps:get(Tok, Conts, #{}),
   Known = maps:get(Pos, Mine, []),
-  Learned#learned{conts = Conts#{Tok => Mine#{Pos => lists:sublist([Reads | Known], ?NOGOODS_PER_NODE)}}}.
+  case lists:member(Entry, Known) of
+    true -> Learned;
+    false -> Learned#learned{conts = Conts#{Tok => Mine#{Pos => lists:sublist([Entry | Known], ?NOGOODS_PER_NODE)}}}
+  end.
 
 %% An activation's continuation nogoods die with it.
 -spec forget_conts(integer(), learned()) -> learned().
@@ -379,36 +392,63 @@ forget_conts(Tok, Learned = #learned{conts = Conts}) ->
 -spec known_cont(integer(), {term(), pos_integer()}, bounds(), learned()) -> false | {true, reads(), reason()}.
 known_cont(Tok, Pos, C, #learned{conts = Conts}) ->
   case Conts of
-    #{Tok := #{Pos := Known}} -> match_nogoods(Known, C);
+    #{Tok := #{Pos := Known}} -> match_conts(Known, C);
+    _ -> false
+  end.
+
+-spec match_conts([{epoch(), reads()}], bounds()) -> false | {true, reads(), reason()}.
+match_conts([], _C) -> false;
+match_conts([{E, Reads} | Rest], C) ->
+  case present_before(maps:next(maps:iterator(Reads)), E, C, []) of
+    {true, Current, Reason} -> {true, Current, Reason};
+    false -> match_conts(Rest, C)
+  end.
+
+%% present/4 over the reads of pieces older than E, the rest skipped.
+-spec present_before(none | {read(), epoch(), maps:iterator()}, epoch(), bounds(), [{read(), piece()}]) -> false | {true, reads(), reason()}.
+present_before(none, _E, C, Found) -> present([], C, Found);
+present_before({_Read, Ep, Next}, E, C, Found) when Ep >= E ->
+  present_before(maps:next(Next), E, C, Found);
+present_before({Read = {V, Side, Node}, _Ep, Next}, E, C, Found) ->
+  case C of
+    #{V := {_, _, Ls, Us}} ->
+      case lists:keyfind(Node, 1, case Side of lower -> Ls; upper -> Us end) of
+        Piece = {Node, _, _} -> present_before(maps:next(Next), E, C, [{Read, Piece} | Found]);
+        false -> false
+      end;
     _ -> false
   end.
 
 %% A nogood applies when every piece it read is present. Its reads come back
 %% with the pieces' current epochs, and its reason is the pieces' current
 %% reasons.
--spec known_failure(ty:type(), bounds(), learned()) -> false | {true, reads(), reason()}.
-known_failure(T, C, #learned{nogoods = Store}) ->
-  case Store of
-    #{T := Known} -> match_nogoods(Known, C);
-    _ -> false
+-spec known_failure(ty:type(), monomorphic_variables(), bounds()) -> false | {true, reads(), reason()}.
+known_failure(T, Fixed, C) ->
+  case ty_node:nogoods(T, Fixed) of
+    [] -> false;
+    Known -> match_nogoods(Known, C)
   end.
 
 -spec match_nogoods([reads()], bounds()) -> false | {true, reads(), reason()}.
 match_nogoods([], _C) -> false;
 match_nogoods([Reads | Rest], C) ->
-  case present(maps:keys(Reads), C, #{}, #{}) of
+  case present(maps:keys(Reads), C, []) of
     {true, Current, Reason} -> {true, Current, Reason};
     false -> match_nogoods(Rest, C)
   end.
 
--spec present([read()], bounds(), reads(), reason()) -> false | {true, reads(), reason()}.
-present([], _C, Current, Reason) -> {true, Current, Reason};
-present([Read = {V, Side, Node} | Rest], C, Current, Reason) ->
+%% The reads and reasons of a match are built only once every piece is found.
+-spec present([read()], bounds(), [{read(), piece()}]) -> false | {true, reads(), reason()}.
+present([], _C, Found) ->
+  {true,
+   maps:from_list([{Read, E} || {Read, {_, _, E}} <- Found]),
+   lists:foldl(fun({_, {_, R, _}}, Acc) -> maps:merge(Acc, R) end, #{}, Found)};
+present([Read = {V, Side, Node} | Rest], C, Found) ->
   case C of
     #{V := {_, _, Ls, Us}} ->
       Pieces = case Side of lower -> Ls; upper -> Us end,
       case lists:keyfind(Node, 1, Pieces) of
-        {Node, R, E} -> present(Rest, C, Current#{Read => E}, maps:merge(Reason, R));
+        Piece = {Node, _, _} -> present(Rest, C, [{Read, Piece} | Found]);
         false -> false
       end;
     _ -> false

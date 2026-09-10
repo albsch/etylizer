@@ -41,6 +41,10 @@
 
   all_variables/1,
   all_variables/2,
+  lines/1,
+  nogoods/2,
+  learn_nogood/3,
+  cached/2,
   substitute/2,
 
   force_load/2
@@ -69,7 +73,10 @@
 -define(NORMCACHE, ty_node_normalize_cache).
 -define(OPCACHE, ty_node_op_cache).
 -define(VARCACHE, ty_node_variables_cache).
--define(ALL_ETS, [?ID, ?SYSTEM, ?P, ?N, ?UNIQUETABLE, ?CACHE, ?NORMCACHE, ?OPCACHE, ?VARCACHE]).
+-define(LINECACHE, ty_node_lines_cache).
+-define(NOGOODS, ty_node_pike_nogoods).
+-define(PIKECACHE, ty_node_pike_cache).
+-define(ALL_ETS, [?ID, ?SYSTEM, ?P, ?N, ?UNIQUETABLE, ?CACHE, ?NORMCACHE, ?OPCACHE, ?VARCACHE, ?LINECACHE, ?NOGOODS, ?PIKECACHE]).
 -define(TY, dnf_ty_variable).
 
 -spec init() -> _.
@@ -572,6 +579,48 @@ collect_node_refs(Body) ->
 %% pre-seeded with that node's children: the seed stops the descent exactly at
 %% the children, which this walk then visits itself. Results are memoized in
 %% ETS as well, since substitute/2 asks for them per node.
+%% A run-wide memo for piking: what the search derives from a node alone.
+-spec cached(term(), fun(() -> T)) -> T.
+cached(Key, Compute) ->
+  case ets:lookup(?PIKECACHE, Key) of
+    [{_, Value}] -> Value;
+    _ ->
+      Value = Compute(),
+      ets:insert(?PIKECACHE, [{Key, Value}]),
+      Value
+  end.
+
+%% Piking nogoods: the sets of bound pieces under which a node could not be
+%% made empty, per node and set of monomorphic variables. A statement about
+%% types, so shared by every problem of the run like the other caches. At
+%% most 32 per node, newest first.
+-spec nogoods(type(), monomorphic_variables()) -> [term()].
+nogoods(Ty, Fixed) ->
+  case ets:lookup(?NOGOODS, {Ty, Fixed}) of
+    [{_, Known}] -> ?assert_type(Known, [term()]);
+    _ -> []
+  end.
+
+-spec learn_nogood(type(), monomorphic_variables(), term()) -> ok.
+learn_nogood(Ty, Fixed, Reads) ->
+  Known = nogoods(Ty, Fixed),
+  case lists:member(Reads, Known) of
+    true -> ok;
+    false -> ets:insert(?NOGOODS, [{{Ty, Fixed}, lists:sublist([Reads | Known], 32)}]), ok
+  end.
+
+%% The minimized DNF lines of a node, cached: piking walks them on every
+%% activation of the node.
+-spec lines(type()) -> [{[variable()], [variable()], ty_rec:type()}].
+lines(Ty) ->
+  case ets:lookup(?LINECACHE, Ty) of
+    [{_, Lines}] -> ?assert_type(Lines, [{[variable()], [variable()], ty_rec:type()}]);
+    _ ->
+      Lines = dnf_ty_variable:minimize_dnf(load(Ty)),
+      ets:insert(?LINECACHE, [{Ty, Lines}]),
+      Lines
+  end.
+
 -spec all_variables(type()) -> sets:set(variable()).
 all_variables(Ty) ->
   case ets:lookup(?VARCACHE, Ty) of
@@ -588,11 +637,17 @@ collect_variables([Node | Rest], Visited, Acc) ->
   case Visited of
     #{Node := _} -> collect_variables(Rest, Visited, Acc);
     _ ->
+     case ets:lookup(?VARCACHE, Node) of
+      [{_, Known}] ->
+        % a node walked before: its variables are known, its DAG is not walked again
+        collect_variables(Rest, Visited#{Node => []}, sets:union(?assert_type(Known, sets:set(variable())), Acc));
+      _ ->
       Body = load(Node),
       Children = collect_node_refs(Body),
       Seed = maps:from_list([{C, []} || C <- Children]),
       Own = ?TY:all_variables(Body, Seed),
       collect_variables(Children ++ Rest, Visited#{Node => []}, sets:union(Own, Acc))
+     end
   end.
 
 -spec all_variables(type(), all_variables_cache()) -> sets:set(variable()).
