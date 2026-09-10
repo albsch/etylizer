@@ -17,7 +17,7 @@
 %% an iterative engine over two stacks: an AND (every DNF line, every tuple
 %% component) pushes the rest of the conjunction onto the continuation
 %% stack K, an OR (some component empty, some negative arrow refuting the
-%% line) is a choice point that pushes its remaining alternatives onto the
+%% line) is a decision that pushes its remaining alternatives onto the
 %% trail and backtracks, and a leaf emits ONE one-sided bound -- alpha <=
 %% single(...) or single(...) <= alpha, the NTLV rule -- which is merged
 %% into C on the spot. When the merge tightens an existing bound, the
@@ -30,27 +30,41 @@
 %%
 %%   partial assignment      the bound map C : variable -> {Lower, Upper}
 %%   literal                 one one-sided bound from the NTLV rule
-%%   clause / decision       an OR of the tuple or function decomposition
+%%   decision                an OR of the tuple or function decomposition
 %%   theory propagation      the consequence goal of a tightened pair
 %%   conflict                a leaf that cannot be made empty under C
+%%   conflict analysis       the reason set of a failure: the decisions the
+%%                           bounds it read depend on
+%%   backjumping             a decision that a failure does not depend on
+%%                           does not try its other alternatives
 %%   model                   K exhausted
 %%
 %% The engine. Goals are data, and the search is three mutually
 %% tail-recursive functions, so it runs in constant Erlang stack however
 %% deep the path:
 %%
-%%   goal/6   runs a goal under the current bounds and achieved set
+%%   goal/7   runs a goal under the current bounds, achieved set and path
 %%   ret/5    the goal succeeded: the next frame of K runs -- the remaining
 %%            conjuncts of an enclosing conjunction
-%%   fail/2   the goal failed: the latest choice point on the trail tries
-%%            its next alternative
+%%   fail/3   the goal failed: the trail is unwound until a decision the
+%%            failure depends on has an alternative left
 %%
 %% A frame of K is what a continuation closes over, and the trail is the
 %% call stack a failure returns through in continuation-passing style: a
-%% choice point for every OR on the path, with the alternatives it has
-%% left. A choice point keeps the bounds, the achieved set and K it was
-%% made under, so its next alternative starts from them; K is a list,
-%% shared by every alternative.
+%% decision for every OR on the path, with the alternatives it has left. A
+%% decision keeps the bounds, the achieved set and K it was made under, so
+%% its next alternative starts from them; K is a list, shared by every
+%% alternative.
+%%
+%% The reasons are what makes the search tractable where normalize is: a
+%% tuple or function decomposition has many independent decisions, and a
+%% later constraint that fails for reasons of its own must not make the
+%% search enumerate their product. Every bound piece carries the decisions
+%% it depends on (the path of decisions above the leaf that emitted it), a
+%% consequence goal inherits the reasons of both pieces it relates, a ground
+%% leaf that cannot be made empty fails with the reasons of its goal, and a
+%% decision whose alternative fails for a reason it is not part of fails
+%% with that reason at once.
 %%
 %% The coinductive hypotheses of the emptiness algorithm and the goals
 %% already achieved on the current path live in X, threaded as an argument
@@ -60,18 +74,23 @@
 %%
 %% Piking searches exactly the tree normalize + saturate materialize:
 %% the same minimized lines, the same singled bounds, the same
-%% decompositions in the same order, with one pruning that loses no answer.
-%% A goal achieved on the path is not redone (C already lies inside it, the
-%% other alternatives only tighten C, and any leaf below a tighter set has a
-%% solution that also satisfies C and the pending goals).
+%% decompositions, with prunings that lose no answer. A goal achieved on the
+%% path is not redone (C already lies inside it, the other alternatives only
+%% tighten C, and any leaf below a tighter set has a solution that also
+%% satisfies C and the pending goals). And a backjump skips alternatives
+%% only when the failure read no bound that the decision produced, so the
+%% same failure exists under every alternative.
 
 -export([is_satisfiable/2]).
 
 -include("constraints.hrl").
 
 -type input_constraints() :: [{ty:type(), ty:type()}].
-%% C: the current bounds of every variable constrained so far.
--type bounds() :: #{variable() => {ty:type(), ty:type()}}.
+%% The decisions a bound piece, a goal or a failure depends on.
+-type reason() :: #{integer() => []}.
+%% C: the bounds of every variable constrained so far, each side with the
+%% decisions its pieces depend on.
+-type bounds() :: #{variable() => {ty:type(), ty:type(), reason(), reason()}}.
 %% X: goals achieved or assumed on the current path. {node, T} is added when
 %% empty(T) starts (coinductive hypothesis) and stays.
 -type achieved() :: #{term() => []}.
@@ -81,16 +100,13 @@
               | {line, {[variable()], [variable()], ty_rec:type()}} % a DNF line of a node
               | {all, [goal()]}                                % a conjunction
               | {phi, [ty:type()], [ty_tuple:type()]}
-              | {without, [ty:type()], ty_tuple:type(), [ty_tuple:type()]} % phi without a negative tuple
               | {explore, ty:type(), ty:type(), [ty_function:type()]}
-              | {split, ty:type(), ty:type(), ty_function:type(), [ty_function:type()]} % explore splitting an arrow off
-              | {refute, ty:type(), [ty_function:type()], ty_function:type()} % a negative arrow refuting a line
               | component().
 %% K, the rest of the search after a goal, innermost frame first.
--type frame() :: {conj, [goal(), ...]}.                % the conjuncts left
+-type frame() :: {conj, [goal(), ...], reason()}.      % the conjuncts left
 -type k() :: [frame()].
-%% The trail: the choice points of the path, innermost first.
--type handler() :: {choice, [goal()], bounds(), achieved(), k()}. % a choice point: alternatives left, its state
+%% The trail: the decisions of the path, innermost first.
+-type handler() :: {decide, [goal()], bounds(), achieved(), k(), reason(), integer(), reason()}. % a decision: alternatives left, its state
 -type trail() :: [handler()].
 
 -record(env, {
@@ -102,135 +118,147 @@
 is_satisfiable(Constraints, Fixed) ->
   Env = #env{fixed = Fixed},
   Goals = [{empty, ty_node:difference(S, T)} || {S, T} <- Constraints],
-  all_of(Goals, #{}, #{}, [], [], Env).
+  all_of(Goals, #{}, #{}, [], [], #{}, Env).
 
 %% --- the engine -------------------------------------------------------------
 
-%% Run a goal.
--spec goal(goal(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-goal({empty, T}, C, X, K, Tr, Env) ->
-  empty(T, C, X, K, Tr, Env);
-goal({all, Goals}, C, X, K, Tr, Env) ->
-  all_of(Goals, C, X, K, Tr, Env);
-goal({phi, BigS, Neg}, C, X, K, Tr, Env) ->
-  phi(BigS, Neg, C, X, K, Tr, Env);
-goal({without, BigS, Ty, N}, C, X, K, Tr, Env) ->
-  all_of(without(BigS, ty_tuple:components(Ty), 1, N), C, X, K, Tr, Env);
-goal({explore, T1, T2, P}, C, X, K, Tr, Env) ->
-  explore(T1, T2, P, C, X, K, Tr, Env);
-goal({split, T1, T2, F, Ps}, C, X, K, Tr, Env) ->
-  split(T1, T2, F, Ps, C, X, K, Tr, Env);
-goal({refute, S, P, F}, C, X, K, Tr, Env) ->
-  refute(S, P, F, C, X, K, Tr, Env);
-goal({line, L}, C, X, K, Tr, Env) ->
-  line(L, C, X, K, Tr, Env);
-goal({tuple, L}, C, X, K, Tr, Env) ->
-  tuple_line(L, C, X, K, Tr, Env);
-goal({function, L}, C, X, K, Tr, Env) ->
-  function_line(L, C, X, K, Tr, Env);
-goal({map, L}, C, X, K, Tr, Env) ->
-  map_line(L, C, X, K, Tr, Env).
+%% Run a goal under the decisions its existence depends on.
+-spec goal(goal(), bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+goal({empty, T}, C, X, K, Tr, Path, Env) ->
+  empty(T, C, X, K, Tr, Path, Env);
+goal({all, Goals}, C, X, K, Tr, Path, Env) ->
+  all_of(Goals, C, X, K, Tr, Path, Env);
+goal({phi, BigS, Neg}, C, X, K, Tr, Path, Env) ->
+  phi(BigS, Neg, C, X, K, Tr, Path, Env);
+goal({explore, T1, T2, P}, C, X, K, Tr, Path, Env) ->
+  explore(T1, T2, P, C, X, K, Tr, Path, Env);
+goal({line, L}, C, X, K, Tr, Path, Env) ->
+  line(L, C, X, K, Tr, Path, Env);
+goal({tuple, L}, C, X, K, Tr, Path, Env) ->
+  tuple_line(L, C, X, K, Tr, Path, Env);
+goal({function, L}, C, X, K, Tr, Path, Env) ->
+  function_line(L, C, X, K, Tr, Path, Env);
+goal({map, L}, C, X, K, Tr, Path, Env) ->
+  map_line(L, C, X, K, Tr, Path, Env).
 
 %% The goal succeeded: the next frame of K runs, and the search succeeds
 %% when there is none.
 -spec ret(bounds(), achieved(), k(), trail(), env()) -> boolean().
 ret(_C, _X, [], _Tr, _Env) -> true;
-ret(C, X, [{conj, Goals} | K], Tr, Env) ->
-  all_of(Goals, C, X, K, Tr, Env).
+ret(C, X, [{conj, Goals, Path} | K], Tr, Env) ->
+  all_of(Goals, C, X, K, Tr, Path, Env).
 
-%% The search failed: the latest choice point on the trail tries its next
-%% alternative, and the search fails when there is none.
--spec fail(trail(), env()) -> boolean().
-fail([], _Env) -> false;
-fail([{choice, Goals, C, X, K} | Tr], Env) ->
-  any_of(Goals, C, X, K, Tr, Env).
+%% The search failed for reason R: the trail is unwound until a decision it
+%% depends on has an alternative left, and the search fails when there is
+%% none.
+-spec fail(reason(), trail(), env()) -> boolean().
+fail(_R, [], _Env) -> false;
+fail(R, [{decide, Goals, C, X, K, Path, D, Acc} | Tr], Env) ->
+  case R of
+    #{D := _} ->
+      decide(Goals, C, X, K, Tr, Path, D, maps:merge(Acc, R), Env);
+    _ ->
+      fail(R, Tr, Env)
+  end.
 
 %% A conjunction: each goal runs with the rest of the conjunction on K, so a
 %% later conjunct that fails backtracks into the choices of the earlier
-%% ones.
--spec all_of([goal()], bounds(), achieved(), k(), trail(), env()) -> boolean().
-all_of([], C, X, K, Tr, Env) -> ret(C, X, K, Tr, Env);
-all_of([G | Gs], C, X, K, Tr, Env) ->
-  K1 = case Gs of [] -> K; _ -> [{conj, Gs} | K] end,
-  goal(G, C, X, K1, Tr, Env).
+%% ones -- or past them, if its reason does not involve them.
+-spec all_of([goal()], bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+all_of([], C, X, K, Tr, _Path, Env) -> ret(C, X, K, Tr, Env);
+all_of([G | Gs], C, X, K, Tr, Path, Env) ->
+  K1 = case Gs of [] -> K; _ -> [{conj, Gs, Path} | K] end,
+  goal(G, C, X, K1, Tr, Path, Env).
 
-%% A disjunction: a choice point. The first alternative under which the
-%% whole remaining search succeeds answers the query.
--spec any_of([goal()], bounds(), achieved(), k(), trail(), env()) -> boolean().
-any_of([], _C, _X, _K, Tr, Env) -> fail(Tr, Env);
-any_of([G | Gs], C, X, K, Tr, Env) ->
-  goal(G, C, X, K, [{choice, Gs, C, X, K} | Tr], Env).
+%% A disjunction: a decision. The first alternative under which the whole
+%% remaining search succeeds answers the query. An alternative that fails
+%% for a reason this decision is not part of fails the decision at once,
+%% since the same failure exists under every other alternative; otherwise
+%% the next alternative is tried, and the reasons of all of them, minus the
+%% decision itself, are the reason the decision fails.
+-spec any_of([goal()], bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+any_of([], _C, _X, _K, Tr, Path, Env) -> fail(Path, Tr, Env);
+any_of(Goals, C, X, K, Tr, Path, Env) ->
+  D = erlang:unique_integer([positive]),
+  decide(Goals, C, X, K, Tr, Path, D, #{}, Env).
+
+-spec decide([goal()], bounds(), achieved(), k(), trail(), reason(), integer(), reason(), env()) -> boolean().
+decide([], _C, _X, _K, Tr, _Path, D, Acc, Env) ->
+  fail(maps:remove(D, Acc), Tr, Env);
+decide([G | Gs], C, X, K, Tr, Path, D, Acc, Env) ->
+  goal(G, C, X, K, [{decide, Gs, C, X, K, Path, D, Acc} | Tr], Path#{D => []}, Env).
 
 %% --- the variable level -----------------------------------------------------
 
 %% Make the node T empty under C.
--spec empty(ty:type(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-empty(T, C, X, K, Tr, Env) ->
+-spec empty(ty:type(), bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+empty(T, C, X, K, Tr, Path, Env) ->
   case X of
     #{{node, T} := _} -> ret(C, X, K, Tr, Env);
     _ ->
       Lines = dnf_ty_variable:minimize_dnf(ty_node:load(T)),
-      all_of([{line, L} || L <- Lines], C, X#{{node, T} => []}, K, Tr, Env)
+      all_of([{line, L} || L <- Lines], C, X#{{node, T} => []}, K, Tr, Path, Env)
   end.
 
 %% One DNF line of the variable BDD: alpha_1 & .. & !beta_1 & .. & Leaf <= 0.
 %% The NTLV rule singles out the smallest polymorphic variable into one
 %% one-sided bound; a line without one is the leaf's problem.
--spec line({[variable()], [variable()], ty_rec:type()}, bounds(), achieved(), k(), trail(), env()) -> boolean().
-line({[], [], Leaf}, C, X, K, Tr, Env) ->
-  leaf_empty(Leaf, C, X, K, Tr, Env);
-line({P, N, Leaf}, C, X, K, Tr, Env = #env{fixed = Fixed}) ->
+-spec line({[variable()], [variable()], ty_rec:type()}, bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+line({[], [], Leaf}, C, X, K, Tr, Path, Env) ->
+  leaf_empty(Leaf, C, X, K, Tr, Path, Env);
+line({P, N, Leaf}, C, X, K, Tr, Path, Env = #env{fixed = Fixed}) ->
   case dnf_ty_variable:smallest(P, N, Fixed) of
     {{pos, V}, _} ->
       U = ty_node:make(dnf_ty_variable:single(true, P -- [V], N, Leaf)),
-      bound_upper(V, U, C, X, K, Tr, Env);
+      bound_upper(V, U, C, X, K, Tr, Path, Env);
     {{neg, V}, _} ->
       L = ty_node:make(dnf_ty_variable:single(false, P, N -- [V], Leaf)),
-      bound_lower(V, L, C, X, K, Tr, Env);
+      bound_lower(V, L, C, X, K, Tr, Path, Env);
     {{{delta, _}, _}, _} ->
       % only monomorphic variables: they are eliminated (Part 1, Lemma C.3/C.11)
-      leaf_empty(Leaf, C, X, K, Tr, Env)
+      leaf_empty(Leaf, C, X, K, Tr, Path, Env)
   end.
 
-%% alpha <= U. Tightening an existing upper bound obliges the lower bound to
-%% fit under the tightened bound: CL <= U1, an empty goal on CL \ U1.
--spec bound_upper(variable(), ty:type(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-bound_upper(V, U, C, X, K, Tr, Env) ->
+%% alpha <= U, a piece depending on Path. Tightening an existing upper bound
+%% obliges the lower bound to fit under the tightened bound: CL <= U1, an
+%% empty goal on CL \ U1 that depends on the reasons of both whole sides.
+-spec bound_upper(variable(), ty:type(), bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+bound_upper(V, U, C, X, K, Tr, Path, Env) ->
   Empty = ty_node:empty(),
   case C of
-    #{V := {CL, CU}} ->
+    #{V := {CL, CU, RL, RU}} ->
       case intersect_bound(U, CU, Env) of
         CU -> ret(C, X, K, Tr, Env);
         U1 ->
-          C1 = C#{V := {CL, U1}},
+          C1 = C#{V := {CL, U1, RL, maps:merge(RU, Path)}},
           case CL of
             Empty -> ret(C1, X, K, Tr, Env);
             _ ->
-              empty(ty_node:difference(CL, U1), C1, X, K, Tr, Env)
+              empty(ty_node:difference(CL, U1), C1, X, K, Tr, maps:merge(RL, maps:merge(RU, Path)), Env)
           end
       end;
     _ ->
-      ret(C#{V => {Empty, U}}, X, K, Tr, Env)
+      ret(C#{V => {Empty, U, #{}, Path}}, X, K, Tr, Env)
   end.
 
 %% L <= alpha, symmetric: the whole lower bound must fit under the upper bound.
--spec bound_lower(variable(), ty:type(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-bound_lower(V, L, C, X, K, Tr, Env) ->
+-spec bound_lower(variable(), ty:type(), bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+bound_lower(V, L, C, X, K, Tr, Path, Env) ->
   Any = ty_node:any(),
   case C of
-    #{V := {CL, CU}} ->
+    #{V := {CL, CU, RL, RU}} ->
       case union_bound(L, CL, Env) of
         CL -> ret(C, X, K, Tr, Env);
         L1 ->
-          C1 = C#{V := {L1, CU}},
+          C1 = C#{V := {L1, CU, maps:merge(RL, Path), RU}},
           case CU of
             Any -> ret(C1, X, K, Tr, Env);
             _ ->
-              empty(ty_node:difference(L1, CU), C1, X, K, Tr, Env)
+              empty(ty_node:difference(L1, CU), C1, X, K, Tr, maps:merge(RU, maps:merge(RL, Path)), Env)
           end
       end;
     _ ->
-      ret(C#{V => {L, Any}}, X, K, Tr, Env)
+      ret(C#{V => {L, Any, Path, #{}}}, X, K, Tr, Env)
   end.
 
 %% --- the leaf level ---------------------------------------------------------
@@ -242,12 +270,12 @@ bound_lower(V, L, C, X, K, Tr, Env) ->
 -type tuple_dnf_line() :: {[ty_tuple:type()], [ty_tuple:type()], ty_bool:type()}.
 -type function_dnf_line() :: {[ty_function:type()], [ty_function:type()], ty_bool:type()}.
 -type map_dnf_line() :: {[ty_map:type()], [ty_map:type()], ty_bool:type()}.
--spec leaf_empty(ty_rec:type(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-leaf_empty(any, _C, _X, _K, Tr, Env) -> fail(Tr, Env);
-leaf_empty(empty, C, X, K, Tr, Env) -> ret(C, X, K, Tr, Env);
-leaf_empty(TyRec, C, X, K, Tr, Env) ->
+-spec leaf_empty(ty_rec:type(), bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+leaf_empty(any, _C, _X, _K, Tr, Path, Env) -> fail(Path, Tr, Env);
+leaf_empty(empty, C, X, K, Tr, _Path, Env) -> ret(C, X, K, Tr, Env);
+leaf_empty(TyRec, C, X, K, Tr, Path, Env) ->
   case basic_empty(TyRec) of
-    false -> fail(Tr, Env);
+    false -> fail(Path, Tr, Env);
     true ->
       {TupDefault, TupArities} = ty_rec:pi(TyRec, ty_tuples),
       {FunDefault, FunArities} = ty_rec:pi(TyRec, ty_functions),
@@ -259,7 +287,7 @@ leaf_empty(TyRec, C, X, K, Tr, Env) ->
         [{function, L} || {_Arity, D} <- lists:sort(maps:to_list(FunArities)), L <- dnf_ty_function:minimize_dnf(D)] ++
         [{function, L} || L <- dnf_ty_function:minimize_dnf(FunDefault)] ++
         [{map, L} || L <- dnf_ty_map:minimize_dnf(ty_rec:pi(TyRec, dnf_ty_map))],
-      all_of(Components, C, X, K, Tr, Env)
+      all_of(Components, C, X, K, Tr, Path, Env)
   end.
 
 -spec basic_empty(ty_rec:type_record()) -> boolean().
@@ -269,35 +297,36 @@ basic_empty(TyRec) ->
     andalso element(1, dnf_ty_interval:is_empty(ty_rec:pi(TyRec, dnf_ty_interval), #{})).
 
 %% One line of a tuple (or list, bitstring) DNF, as dnf_ty_tuple:normalize_line.
--spec tuple_line(tuple_dnf_line(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-tuple_line({[], [], _}, _C, _X, _K, Tr, Env) -> fail(Tr, Env); % the whole product: never empty
-tuple_line({[], Neg = [TNeg | _], Leaf}, C, X, K, Tr, Env) ->
+-spec tuple_line(tuple_dnf_line(), bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+tuple_line({[], [], _}, _C, _X, _K, Tr, Path, Env) -> fail(Path, Tr, Env); % the whole product: never empty
+tuple_line({[], Neg = [TNeg | _], Leaf}, C, X, K, Tr, Path, Env) ->
   Dim = length(ty_tuple:components(TNeg)),
-  tuple_line({[ty_tuple:any(Dim)], Neg, Leaf}, C, X, K, Tr, Env);
-tuple_line({Pos, Neg, _}, C, X, K, Tr, Env) ->
-  phi(ty_tuple:components(ty_tuple:big_intersect(Pos)), Neg, C, X, K, Tr, Env).
+  tuple_line({[ty_tuple:any(Dim)], Neg, Leaf}, C, X, K, Tr, Path, Env);
+tuple_line({Pos, Neg, _}, C, X, K, Tr, Path, Env) ->
+  phi(ty_tuple:components(ty_tuple:big_intersect(Pos)), Neg, C, X, K, Tr, Path, Env).
 
 %% One line of a map DNF, as dnf_ty_map:normalize_line: maps are encoded as a
 %% pair of a tuple part and a function part, with its own any.
--spec map_line(map_dnf_line(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-map_line({[], [], _}, _C, _X, _K, Tr, Env) -> fail(Tr, Env);
-map_line({[], Neg = [_ | _], Leaf}, C, X, K, Tr, Env) ->
+-spec map_line(map_dnf_line(), bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+map_line({[], [], _}, _C, _X, _K, Tr, Path, Env) -> fail(Path, Tr, Env);
+map_line({[], Neg = [_ | _], Leaf}, C, X, K, Tr, Path, Env) ->
   P1 = ty:tuples(ty_tuples:singleton(2, dnf_ty_tuple:any())),
   P2 = ty:functions(ty_functions:singleton(2, dnf_ty_function:any())),
-  map_line({[ty_map:map(P1, P2)], Neg, Leaf}, C, X, K, Tr, Env);
-map_line({Pos, Neg, _}, C, X, K, Tr, Env) ->
-  phi(ty_tuple:components(ty_tuple:big_intersect(Pos)), Neg, C, X, K, Tr, Env).
+  map_line({[ty_map:map(P1, P2)], Neg, Leaf}, C, X, K, Tr, Path, Env);
+map_line({Pos, Neg, _}, C, X, K, Tr, Path, Env) ->
+  phi(ty_tuple:components(ty_tuple:big_intersect(Pos)), Neg, C, X, K, Tr, Path, Env).
 
 %% S1 x .. x Sn \ (N1 | .. | Nk) <= 0, as dnf_ty_tuple:phi_norm: some Si is
 %% empty, or for the first negative tuple N1, for every component i the
-%% product with Si \ N1_i is empty without N1.
--spec phi([ty:type()], [ty_tuple:type()], bounds(), achieved(), k(), trail(), env()) -> boolean().
-phi(BigS, Neg, C, X, K, Tr, Env) ->
+%% product with Si \ N1_i is empty without N1. One decision.
+-spec phi([ty:type()], [ty_tuple:type()], bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+phi(BigS, Neg, C, X, K, Tr, Path, Env) ->
   Components = [{empty, S} || S <- BigS],
-  case Neg of
-    [] -> any_of(Components, C, X, K, Tr, Env);
-    [Ty | N] -> any_of(Components ++ [{without, BigS, Ty, N}], C, X, K, Tr, Env)
-  end.
+  Alternatives = case Neg of
+    [] -> Components;
+    [Ty | N] -> Components ++ [{all, without(BigS, ty_tuple:components(Ty), 1, N)}]
+  end,
+  any_of(Alternatives, C, X, K, Tr, Path, Env).
 
 -spec without([ty:type()], [ty:type()], pos_integer(), [ty_tuple:type()]) -> [goal()].
 without(_BigS, [], _I, _N) -> [];
@@ -311,33 +340,30 @@ replace_at(I, [H | T], NComp) -> [H | replace_at(I - 1, T, NComp)].
 %% One line of a function DNF, as dnf_ty_function:normalize_line: some
 %% negative arrow T1 -> T2 refutes the intersection of the positive arrows,
 %% which needs T1 inside the union S of the domains and explore to hold.
--spec function_line(function_dnf_line(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-function_line({Pos, Neg, _}, C, X, K, Tr, Env) ->
+%% Which negative arrow is one decision.
+-spec function_line(function_dnf_line(), bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+function_line({Pos, Neg, _}, C, X, K, Tr, Path, Env) ->
   S = ty_node:disjunction([ty_function:domain(F) || F <- Pos]),
-  % no negative arrow: never empty
-  any_of([{refute, S, Pos, F} || F <- Neg], C, X, K, Tr, Env).
-
--spec refute(ty:type(), [ty_function:type()], ty_function:type(), bounds(), achieved(), k(), trail(), env()) -> boolean().
-refute(S, P, F, C, X, K, Tr, Env) ->
-  T1 = ty_function:domain(F),
-  T2 = ty_function:codomain(F),
-  all_of([{empty, ty_node:intersect(T1, ty_node:negate(S))},
-          {explore, T1, ty_node:negate(T2), P}], C, X, K, Tr, Env).
+  NotS = ty_node:negate(S),
+  Alternatives =
+    [{all, [{empty, ty_node:intersect(ty_function:domain(F), NotS)},
+            {explore, ty_function:domain(F), ty_node:negate(ty_function:codomain(F)), Pos}]}
+     || F <- Neg],
+  any_of(Alternatives, C, X, K, Tr, Path, Env).
 
 %% As dnf_ty_function:explore_function_norm: T1 empty, or T2 empty, or the
-%% positive arrow S1 -> S2 is split off on both sides.
--spec explore(ty:type(), ty:type(), [ty_function:type()], bounds(), achieved(), k(), trail(), env()) -> boolean().
-explore(T1, T2, [], C, X, K, Tr, Env) ->
-  any_of([{empty, T1}, {empty, T2}], C, X, K, Tr, Env);
-explore(T1, T2, [F | Ps], C, X, K, Tr, Env) ->
-  any_of([{empty, T1}, {empty, T2}, {split, T1, T2, F, Ps}], C, X, K, Tr, Env).
-
--spec split(ty:type(), ty:type(), ty_function:type(), [ty_function:type()], bounds(), achieved(), k(), trail(), env()) -> boolean().
-split(T1, T2, F, Ps, C, X, K, Tr, Env) ->
+%% positive arrow S1 -> S2 is split off on both sides. One decision.
+-spec explore(ty:type(), ty:type(), [ty_function:type()], bounds(), achieved(), k(), trail(), reason(), env()) -> boolean().
+explore(T1, T2, [], C, X, K, Tr, Path, Env) ->
+  any_of([{empty, T1}, {empty, T2}], C, X, K, Tr, Path, Env);
+explore(T1, T2, [F | Ps], C, X, K, Tr, Path, Env) ->
   S1 = ty_function:domain(F),
   S2 = ty_function:codomain(F),
-  all_of([{explore, T1, ty_node:intersect(T2, S2), Ps},
-          {explore, ty_node:difference(T1, S1), T2, Ps}], C, X, K, Tr, Env).
+  any_of([{empty, T1},
+          {empty, T2},
+          {all, [{explore, T1, ty_node:intersect(T2, S2), Ps},
+                 {explore, ty_node:difference(T1, S1), T2, Ps}]}],
+         C, X, K, Tr, Path, Env).
 
 %% --- bounds -----------------------------------------------------------------
 
