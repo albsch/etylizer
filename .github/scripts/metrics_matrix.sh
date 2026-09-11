@@ -23,7 +23,7 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"      # where ety_metrics_report lives
-REPORT_TIMEOUT="${REPORT_TIMEOUT:-4000}"
+REPORT_TIMEOUT="${REPORT_TIMEOUT:-10000}"
 
 suite_sdir() { case "$1" in
   etylizer)     echo "src" ;;
