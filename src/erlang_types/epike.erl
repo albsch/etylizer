@@ -480,8 +480,21 @@ explore(T1, T2, P = [F | Ps], S = #s{x = X}, K, Path, Env) ->
 
 %% --- bounds -----------------------------------------------------------------
 
+%% Identical nodes need no engine call; the empty and any nodes are units.
 -spec union_bound(T, T, env()) -> T when T :: ty:type().
-union_bound(A, B, _Env) -> ty_node:union(A, B).
+union_bound(A, A, _Env) -> A;
+union_bound(A, B, _Env) ->
+  case ty_node:empty() of
+    A -> B;
+    B -> A;
+    _ -> ty_node:union(A, B)
+  end.
 
 -spec intersect_bound(T, T, env()) -> T when T :: ty:type().
-intersect_bound(A, B, _Env) -> ty_node:intersect(A, B).
+intersect_bound(A, A, _Env) -> A;
+intersect_bound(A, B, _Env) ->
+  case ty_node:any() of
+    A -> B;
+    B -> A;
+    _ -> ty_node:intersect(A, B)
+  end.
