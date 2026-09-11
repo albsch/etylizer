@@ -29,6 +29,11 @@ set -e
 # dnf_ty_{...}:replace_index/4
 #     erlang:setelement/3 on a tuple used as a mutable array; not modeled.
 #
+# --- erlang_types: emptiness cache record ---------------------------------
+# ty_node:memo_put/3
+#     Projects the \{false, Cache\} pair of memo_false/2 with element/2; the
+#     checker does not refine the tuple element.
+#
 # --- erlang_types: integer guard refinement ---------------------------------
 # ty_node:compare/2
 # dnf_ty_interval:compare_int/2
@@ -66,6 +71,7 @@ set -e
     -i 'ty_parser:group/3' \
     -i 'dnf_ty_predefined:is_empty/2' \
     -i 'dnf_ty_predefined:unparse/2' \
+    -i 'ty_node:memo_put/3' \
     -i 'ty_node:compare/2' \
     -i "dnf_ty_interval:'_collect_port_output'/2" \
     -i 'dnf_ty_interval:compare_int/2' \
