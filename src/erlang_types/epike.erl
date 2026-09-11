@@ -88,7 +88,8 @@
 %% decisions its pieces depend on.
 -type bounds() :: #{variable() => {ty:type(), ty:type(), reason(), reason()}}.
 %% X: goals achieved or assumed on the current path. {node, T} is added when
-%% empty(T) starts (coinductive hypothesis) and stays.
+%% empty(T) starts (coinductive hypothesis) and stays; phi and explore keys
+%% are added when the sub-goal completes.
 -type achieved() :: #{term() => []}.
 %% The bounds an activation has read, first read wins.
 -type reads() :: #{variable() => {ty:type(), ty:type()}}.
@@ -412,15 +413,21 @@ map_line({Pos, Neg, _}, S, K, Path, Env) ->
 %% component is already empty on this path.
 -spec phi([ty:type()], [ty_tuple:type()], s(), k(), reason(), env()) -> result().
 phi(BigS, Neg, S = #s{x = X}, K, Path, Env) ->
-  case lists:any(fun(Si) -> maps:is_key({node, Si}, X) end, BigS) of
-    true -> K(S);
-    false ->
-      Components = [empty_goal(Si, Env) || Si <- BigS],
-      Alternatives = case Neg of
-        [] -> Components;
-        [Ty | N] -> Components ++ [all_goal(without(BigS, ty_tuple:components(Ty), 1, N, Env))]
-      end,
-      any_of(Alternatives, S, K, Path)
+  Key = {phi, BigS, Neg},
+  case X of
+    #{Key := _} -> K(S);
+    _ ->
+      K1 = fun(S1 = #s{x = X1}) -> K(S1#s{x = X1#{Key => []}}) end,
+      case lists:any(fun(Si) -> maps:is_key({node, Si}, X) end, BigS) of
+        true -> K1(S);
+        false ->
+          Components = [empty_goal(Si, Env) || Si <- BigS],
+          Alternatives = case Neg of
+            [] -> Components;
+            [Ty | N] -> Components ++ [all_goal(without(BigS, ty_tuple:components(Ty), 1, N, Env))]
+          end,
+          any_of(Alternatives, S, K1, Path)
+      end
   end.
 
 -spec without([ty:type()], [ty:type()], pos_integer(), [ty_tuple:type()], env()) -> [goal()].
@@ -452,17 +459,23 @@ function_line({Pos, Neg, _}, S, K, Path, Env) ->
 -spec explore(ty:type(), ty:type(), [ty_function:type()], s(), k(), reason(), env()) -> result().
 explore(T1, T2, [], S, K, Path, Env) ->
   any_of([empty_goal(T1, Env), empty_goal(T2, Env)], S, K, Path);
-explore(T1, T2, [F | Ps], S = #s{x = X}, K, Path, Env) ->
-  case maps:is_key({node, T1}, X) orelse maps:is_key({node, T2}, X) of
-    true -> K(S);
-    false ->
-      S1 = ty_function:domain(F),
-      S2 = ty_function:codomain(F),
-      any_of([empty_goal(T1, Env),
-              empty_goal(T2, Env),
-              all_goal([explore_goal(T1, ty_node:intersect(T2, S2), Ps, Env),
-                        explore_goal(ty_node:difference(T1, S1), T2, Ps, Env)])],
-             S, K, Path)
+explore(T1, T2, P = [F | Ps], S = #s{x = X}, K, Path, Env) ->
+  Key = {explore, T1, T2, P},
+  case X of
+    #{Key := _} -> K(S);
+    _ ->
+      K1 = fun(S1 = #s{x = X1}) -> K(S1#s{x = X1#{Key => []}}) end,
+      case maps:is_key({node, T1}, X) orelse maps:is_key({node, T2}, X) of
+        true -> K1(S);
+        false ->
+          S1 = ty_function:domain(F),
+          S2 = ty_function:codomain(F),
+          any_of([empty_goal(T1, Env),
+                  empty_goal(T2, Env),
+                  all_goal([explore_goal(T1, ty_node:intersect(T2, S2), Ps, Env),
+                            explore_goal(ty_node:difference(T1, S1), T2, Ps, Env)])],
+                 S, K1, Path)
+      end
   end.
 
 %% --- bounds -----------------------------------------------------------------
