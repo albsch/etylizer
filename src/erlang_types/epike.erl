@@ -49,7 +49,8 @@
 %%   goal/6   runs a goal under the current state and path
 %%   ret/4    the goal succeeded: the next frame of K runs -- the remaining
 %%            conjuncts of an enclosing conjunction, the exit of an
-%%            enclosing activation
+%%            enclosing activation, the key of an enclosing phi or explore
+%%            goal to add to X
 %%   fail/5   the goal failed: the trail is unwound, every handler seeing
 %%            the failure in turn -- the tag of every activation whose
 %%            continuation ran, the nogood of every activation that failed
@@ -110,7 +111,8 @@
 %% decisions its pieces depend on.
 -type bounds() :: #{variable() => {ty:type(), ty:type(), reason(), reason()}}.
 %% X: goals achieved or assumed on the current path. {node, T} is added when
-%% empty(T) starts (coinductive hypothesis) and stays.
+%% empty(T) starts (coinductive hypothesis) and stays; phi and explore keys
+%% are added when the sub-goal completes.
 -type achieved() :: #{term() => []}.
 %% The bounds an activation has read, first read wins.
 -type reads() :: #{variable() => {ty:type(), ty:type()}}.
@@ -133,7 +135,8 @@
               | component().
 %% K, the rest of the search after a goal, innermost frame first.
 -type frame() :: {conj, [goal(), ...], reason()}      % the conjuncts left
-               | {exit, reads(), integer()}.          % leave an activation: its reads, its token
+               | {exit, reads(), integer()}           % leave an activation: its reads, its token
+               | {achieve, term()}.                   % a phi or explore goal completed
 -type k() :: [frame()].
 %% The trail: what a failure meets on its way back, innermost first.
 -type handler() :: {decide, [goal()], s(), k(), reason(), integer(), reason(), reads()} % a decision: alternatives left, its state
@@ -185,7 +188,9 @@ ret(S, [{conj, Goals, Path} | K], Tr, Env) ->
 ret(S = #s{reads = ReadsIn}, [{exit, Reads0, Tok} | K], Tr, Env) ->
   % the activation hands its reads on; from here on a failure is one of
   % the rest of the search, which the tag tells its activation
-  ret(S#s{reads = merge_reads(Reads0, ReadsIn)}, K, [{tag, Tok} | Tr], Env).
+  ret(S#s{reads = merge_reads(Reads0, ReadsIn)}, K, [{tag, Tok} | Tr], Env);
+ret(S = #s{x = X}, [{achieve, Key} | K], Tr, Env) ->
+  ret(S#s{x = X#{Key => []}}, K, Tr, Env).
 
 %% A goal fails at once under the decisions of its path, with the reads and
 %% what was learned of the state it failed in.
@@ -455,15 +460,20 @@ map_line({Pos, Neg, _}, S, K, Tr, Path, Env) ->
 %% component is already empty on this path.
 -spec phi([ty:type()], [ty_tuple:type()], s(), k(), trail(), reason(), env()) -> boolean().
 phi(BigS, Neg, S = #s{x = X}, K, Tr, Path, Env) ->
-  case lists:any(fun(Si) -> maps:is_key({node, Si}, X) end, BigS) of
-    true -> ret(S, K, Tr, Env);
-    false ->
-      Components = [{empty, Si} || Si <- BigS],
-      Alternatives = case Neg of
-        [] -> Components;
-        [Ty | N] -> Components ++ [{all, without(BigS, ty_tuple:components(Ty), 1, N)}]
-      end,
-      any_of(Alternatives, S, K, Tr, Path, Env)
+  Key = {phi, BigS, Neg},
+  case X of
+    #{Key := _} -> ret(S, K, Tr, Env);
+    _ ->
+      case lists:any(fun(Si) -> maps:is_key({node, Si}, X) end, BigS) of
+        true -> ret(S#s{x = X#{Key => []}}, K, Tr, Env);
+        false ->
+          Components = [{empty, Si} || Si <- BigS],
+          Alternatives = case Neg of
+            [] -> Components;
+            [Ty | N] -> Components ++ [{all, without(BigS, ty_tuple:components(Ty), 1, N)}]
+          end,
+          any_of(Alternatives, S, [{achieve, Key} | K], Tr, Path, Env)
+      end
   end.
 
 -spec without([ty:type()], [ty:type()], pos_integer(), [ty_tuple:type()]) -> [goal()].
@@ -495,17 +505,22 @@ function_line({Pos, Neg, _}, S, K, Tr, Path, Env) ->
 -spec explore(ty:type(), ty:type(), [ty_function:type()], s(), k(), trail(), reason(), env()) -> boolean().
 explore(T1, T2, [], S, K, Tr, Path, Env) ->
   any_of([{empty, T1}, {empty, T2}], S, K, Tr, Path, Env);
-explore(T1, T2, [F | Ps], S = #s{x = X}, K, Tr, Path, Env) ->
-  case maps:is_key({node, T1}, X) orelse maps:is_key({node, T2}, X) of
-    true -> ret(S, K, Tr, Env);
-    false ->
-      S1 = ty_function:domain(F),
-      S2 = ty_function:codomain(F),
-      any_of([{empty, T1},
-              {empty, T2},
-              {all, [{explore, T1, ty_node:intersect(T2, S2), Ps},
-                     {explore, ty_node:difference(T1, S1), T2, Ps}]}],
-             S, K, Tr, Path, Env)
+explore(T1, T2, P = [F | Ps], S = #s{x = X}, K, Tr, Path, Env) ->
+  Key = {explore, T1, T2, P},
+  case X of
+    #{Key := _} -> ret(S, K, Tr, Env);
+    _ ->
+      case maps:is_key({node, T1}, X) orelse maps:is_key({node, T2}, X) of
+        true -> ret(S#s{x = X#{Key => []}}, K, Tr, Env);
+        false ->
+          S1 = ty_function:domain(F),
+          S2 = ty_function:codomain(F),
+          any_of([{empty, T1},
+                  {empty, T2},
+                  {all, [{explore, T1, ty_node:intersect(T2, S2), Ps},
+                         {explore, ty_node:difference(T1, S1), T2, Ps}]}],
+                 S, [{achieve, Key} | K], Tr, Path, Env)
+      end
   end.
 
 %% --- bounds -----------------------------------------------------------------
