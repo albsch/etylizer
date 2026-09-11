@@ -17,7 +17,7 @@
 -include("sanity.hrl").
 -include("constraints.hrl").
 
--define(TALLY_DEFAULT(), is_satisfiable_v4).
+-define(TALLY_DEFAULT(), epike:is_satisfiable).
 
 -type normalized_set_of_constraint_sets() :: set_of_constraint_sets(). % normalized set of constraint sets
 -type solutions() :: set_of_constraint_sets(). % saturated set of constraint sets
@@ -35,6 +35,8 @@ is_tally_satisfiable(Constraints, MonomorphicVariables) ->
     "v2" -> is_satisfiable_v2(Constraints, MonomorphicVariables);
     "v3" -> is_satisfiable_v3(Constraints, MonomorphicVariables);
     "v4" -> is_satisfiable_v4(Constraints, MonomorphicVariables);
+    "pike" -> epike:is_satisfiable(Constraints, MonomorphicVariables);
+    "none" -> true; % measurement: the pipeline cost without any search
     _ -> ?TALLY_DEFAULT()(Constraints, MonomorphicVariables)
   end.
 

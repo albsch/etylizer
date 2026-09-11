@@ -34,8 +34,22 @@ is_empty_line({Pos, Neg, T}, ST) ->
   phi(ty_tuple:components(BigS), Neg, ST).
 
 
+%% Memoized by (BigS, NegList), as phi_norm is: without it the same
+%% sub-problem of a large difference of tuple unions is decided once per
+%% path through the decomposition. The memo shares the emptiness cache, so
+%% the entries follow its coinductive rollback.
 -spec phi([ty:type()], [?ATOM:type()], S) -> {boolean(), S} when S :: is_empty_cache().
-phi(BigS, [], ST) ->
+phi(BigS, NegList, ST) ->
+  Key = {phi_tuple_memo, BigS, NegList},
+  case ?NODE:memo_lookup(Key, ST) of
+    {ok, Cached} -> {Cached, ST};
+    none ->
+      {Res, ST1} = phi_impl(BigS, NegList, ST),
+      {Res, ?NODE:memo_put(Key, Res, ST1)}
+  end.
+
+-spec phi_impl([ty:type()], [?ATOM:type()], S) -> {boolean(), S} when S :: is_empty_cache().
+phi_impl(BigS, [], ST) ->
   % TODO how big of a performance hit is non-shortcut behavior of the true branch?
   lists:foldl(
     fun(_, {true, ST0}) -> {true, ST0};
@@ -43,7 +57,7 @@ phi(BigS, [], ST) ->
     end, 
     {false, ST}, 
   BigS);
-phi(BigS, [Ty | N], ST) ->
+phi_impl(BigS, [Ty | N], ST) ->
   maybe
     {false, ST1} ?= lists:foldl(fun(_S, {true, ST0}) -> {true, ST0}; (S, {false, ST0}) -> ?NODE:is_empty(S, ST0) end, {false, ST}, BigS),
     phi_fold_components(BigS, ty_tuple:components(Ty), 1, {true, ST1}, N)

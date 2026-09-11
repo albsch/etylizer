@@ -49,14 +49,26 @@ explore_function(T1, T2, [Function | Ps], ST0) ->
     phi(?NODE:difference(T1, S1), T2, Ps, ST1)
   end.
 
--spec phi(Ty, Ty, [?ATOM:type()], S) -> 
+%% Memoized by (T1, T2, Ps) in the emptiness cache, as the tuple phi is.
+-spec phi(Ty, Ty, [?ATOM:type()], S) ->
     {boolean(), S} when S :: is_empty_cache(), Ty :: ty_node:type().
-phi(T1, T2, [], ST0) ->
+phi(T1, T2, Ps, ST) ->
+  Key = {phi_fun_memo, T1, T2, Ps},
+  case ?NODE:memo_lookup(Key, ST) of
+    {ok, Cached} -> {Cached, ST};
+    none ->
+      {Res, ST1} = phi_impl(T1, T2, Ps, ST),
+      {Res, ?NODE:memo_put(Key, Res, ST1)}
+  end.
+
+-spec phi_impl(Ty, Ty, [?ATOM:type()], S) ->
+    {boolean(), S} when S :: is_empty_cache(), Ty :: ty_node:type().
+phi_impl(T1, T2, [], ST0) ->
   maybe
     {false, ST1} ?= ?NODE:is_empty(T1, ST0),
     ?NODE:is_empty(T2, ST1)
   end;
-phi(T1, T2, [Function | Ps], ST0) ->
+phi_impl(T1, T2, [Function | Ps], ST0) ->
   {S1, S2} = {ty_function:domain(Function), ty_function:codomain(Function)},
   maybe 
     {false, ST1} ?= ?NODE:is_empty(T1, ST0),

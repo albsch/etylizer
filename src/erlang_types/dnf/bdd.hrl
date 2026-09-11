@@ -232,7 +232,9 @@ dnf_acc(Acc, Ps, Ns, {node, A, P, N}) ->
 
 -spec is_empty(type(), S) -> {boolean(), S} when S :: is_empty_cache().
 is_empty(Ty, ST) ->
-    Dnf = dnf(Ty),
+    % the minimized lines, as normalize/3 walks: the raw DNF of a large union
+    % with many negations has exponentially more lines than the minimizer keeps
+    Dnf = minimize_dnf(Ty),
     lists:foldl(fun
         (_Line, {false, ST0}) -> {false, ST0};
         (Line, {true, ST0}) -> is_empty_line(Line, ST0)

@@ -21,6 +21,8 @@
   load/1,
 
   is_empty/1, 
+  memo_lookup/2,
+  memo_put/3,
   normalize/2,
   leq/2,
 
@@ -41,6 +43,10 @@
 
   all_variables/1,
   all_variables/2,
+  lines/1,
+  nogoods/2,
+  learn_nogood/3,
+  cached/2,
   substitute/2,
 
   force_load/2
@@ -68,7 +74,11 @@
 -define(CACHE, ty_node_cache).
 -define(NORMCACHE, ty_node_normalize_cache).
 -define(OPCACHE, ty_node_op_cache).
--define(ALL_ETS, [?ID, ?SYSTEM, ?P, ?N, ?UNIQUETABLE, ?CACHE, ?NORMCACHE, ?OPCACHE]).
+-define(VARCACHE, ty_node_variables_cache).
+-define(LINECACHE, ty_node_lines_cache).
+-define(NOGOODS, ty_node_pike_nogoods).
+-define(PIKECACHE, ty_node_pike_cache).
+-define(ALL_ETS, [?ID, ?SYSTEM, ?P, ?N, ?UNIQUETABLE, ?CACHE, ?NORMCACHE, ?OPCACHE, ?VARCACHE, ?LINECACHE, ?NOGOODS, ?PIKECACHE]).
 -define(TY, dnf_ty_variable).
 
 -spec init() -> _.
@@ -171,8 +181,11 @@ is_empty(TyNode) ->
     [{_, R}] -> ?assert_type(R, boolean());
     [_ | _] -> error(invariant);
     [] ->
-      {Result, LocalCache} = is_empty(TyNode, #{}),
-      utils:update_ets_from_map(?CACHE, LocalCache),
+      {Result, #is_empty_cache{memo = Memo, facts = Facts}} = is_empty(TyNode, #is_empty_cache{}),
+      % the verdicts on nodes are valid for the run: memo after a true outcome
+      % holds none that rest on an assumption, facts never do
+      Nodes = fun(M) -> maps:filter(fun({node, _}, _) -> true; (_, _) -> false end, M) end,
+      utils:update_ets_from_map(?CACHE, maps:merge(Nodes(Memo), Nodes(Facts))),
       ets:insert(?CACHE, [{TyNode, Result}]),
       Result
   end.
@@ -185,31 +198,54 @@ is_empty(TyNode) ->
 %   where caching *during* the recursive computation would benefit
 %   the time to solve
 -spec is_empty(type(), S) -> {boolean(), S} when S :: is_empty_cache().
-is_empty(TyNode, LocalCache) ->
-  Ty = load(TyNode),
-
-  case LocalCache of
-    #{Ty := Res} -> {Res, LocalCache};
-    _ -> 
+is_empty(TyNode, Cache = #is_empty_cache{memo = Memo}) ->
+  % keyed by the node, not by the loaded descriptor: nodes are consed, and
+  % hashing a large descriptor on every lookup dominated big emptiness checks
+  case memo_lookup(TyNode, Cache) of
+    {ok, Res} -> {Res, Cache};
+    none ->
+      Ty = load(TyNode),
       % assume type is empty and add to state
       % N U {t}
-      {Result, LC_0} = ?TY:is_empty(Ty, LocalCache#{Ty => true}),
+      {Result, LC_0} = ?TY:is_empty(Ty, Cache#is_empty_cache{memo = Memo#{TyNode => true}}),
 
-      case Result of 
-        % empty; 
-        % local cache can be kept as is 
+      case Result of
+        % empty;
+        % local cache can be kept as is
         % Ty is empty is now cached, and all intermediate results are also cached
         true -> {true, LC_0};
 
         % not empty;
-        % invalidate all types that were assumed to be empty
-        %  => recover initial N
-        % and add Ty to be non-empty to the cache
-        % we don't need to backtrack (there is no single global cache), 
-        % use the LocalCache from the arguments
-        false -> {false, LocalCache#{Ty => false}}
+        % the types assumed empty on the way are not known to be, so the
+        % initial assumptions are restored; but a non-emptiness found on the
+        % way never rests on an assumption (assumptions only ever make a type
+        % empty), so the facts gathered on the way stay. They live in their
+        % own sub-map, so keeping them costs nothing: without them a large
+        % non-empty type was re-explored once per path through its structure.
+        false -> memo_false(TyNode, Cache#is_empty_cache{facts = LC_0#is_empty_cache.facts})
       end
   end.
+
+%% The emptiness cache, see erlang_types.hrl. The tuple and function
+%% decompositions memoize their sub-problems in it with the same discipline.
+-spec memo_lookup(is_empty_memo_key(), is_empty_cache()) -> {ok, boolean()} | none.
+memo_lookup(Key, #is_empty_cache{memo = Memo, facts = Facts}) ->
+  case Memo of
+    #{Key := Res} -> {ok, Res};
+    _ ->
+      case Facts of
+        #{Key := Res} -> {ok, Res};
+        _ -> none
+      end
+  end.
+
+-spec memo_put(is_empty_memo_key(), boolean(), is_empty_cache()) -> is_empty_cache().
+memo_put(Key, true, Cache = #is_empty_cache{memo = Memo}) -> Cache#is_empty_cache{memo = Memo#{Key => true}};
+memo_put(Key, false, Cache) -> element(2, memo_false(Key, Cache)).
+
+-spec memo_false(is_empty_memo_key(), is_empty_cache()) -> {false, is_empty_cache()}.
+memo_false(Key, Cache = #is_empty_cache{facts = Facts}) ->
+  {false, Cache#is_empty_cache{facts = Facts#{Key => false}}}.
 
 -spec negate(T) -> T when T :: type().
 negate(T) ->
@@ -560,9 +596,125 @@ collect_node_refs(Body) ->
     fun(E = {node, Id}) when is_integer(Id) -> {ok, E}; (_) -> error end,
     Body).
 
+%% all_variables/2 threads its visited set *down* the recursion but never across
+%% siblings, and keeps no memo, so a node reachable by k paths is expanded k
+%% times: the cost is exponential in the depth of the node DAG rather than
+%% linear in its size. On the shared unions produced by large symbol tables a
+%% single call does not return in any practical time.
+%%
+%% Walk the DAG here instead, with a real visited set, so every node is expanded
+%% exactly once. A node's own layer is read by handing all_variables/2 a cache
+%% pre-seeded with that node's children: the seed stops the descent exactly at
+%% the children, which this walk then visits itself. Results are memoized in
+%% ETS as well, since substitute/2 asks for them per node.
+%% A run-wide memo for piking: what the search derives from a node alone.
+-spec cached(term(), fun(() -> term())) -> term().
+cached(Key, Compute) ->
+  case ets:lookup(?PIKECACHE, Key) of
+    [{_, Value}] -> Value;
+    _ ->
+      Value = Compute(),
+      ets:insert(?PIKECACHE, [{Key, Value}]),
+      Value
+  end.
+
+%% Piking nogoods: the sets of bound pieces under which a node could not be
+%% made empty, per node and set of monomorphic variables. A statement about
+%% types, so shared by every problem of the run like the other caches. At
+%% most 32 per node, newest first.
+-spec nogoods(type(), monomorphic_variables()) -> [term()].
+nogoods(Ty, Fixed) ->
+  case ets:lookup(?NOGOODS, {Ty, Fixed}) of
+    [{_, Known}] -> ?assert_type(Known, [term()]);
+    _ -> []
+  end.
+
+-spec learn_nogood(type(), monomorphic_variables(), term()) -> ok.
+learn_nogood(Ty, Fixed, Reads) ->
+  Known = nogoods(Ty, Fixed),
+  case lists:member(Reads, Known) of
+    true -> ok;
+    false -> ets:insert(?NOGOODS, [{{Ty, Fixed}, lists:sublist([Reads | Known], 32)}]), ok
+  end.
+
+%% The minimized DNF lines of a node, cached: piking walks them on every
+%% activation of the node.
+-spec lines(type()) -> [{[variable()], [variable()], ty_rec:type()}].
+lines(Ty) ->
+  case ets:lookup(?LINECACHE, Ty) of
+    [{_, Lines}] -> ?assert_type(Lines, [{[variable()], [variable()], ty_rec:type()}]);
+    _ ->
+      Lines = dnf_ty_variable:minimize_dnf(load(Ty)),
+      ets:insert(?LINECACHE, [{Ty, Lines}]),
+      Lines
+  end.
+
 -spec all_variables(type()) -> sets:set(variable()).
 all_variables(Ty) ->
-  all_variables(Ty, #{}).
+  case ets:lookup(?VARCACHE, Ty) of
+    [{_, Result}] -> ?assert_type(Result, sets:set(variable()));
+    _ ->
+      %% Every node reachable from Ty that is not cached yet is walked once,
+      %% the strongly connected components of that graph are computed, and
+      %% each component gets one set -- its members reach each other, so they
+      %% reach the same nodes -- which is cached for all of them. The search
+      %% asks for the variables of many new nodes built from the same large,
+      %% recursive types; before, only the root of a walk was cached and every
+      %% new node re-walked the whole DAG below it.
+      Graph = uncached_graph([Ty], #{}),
+      Internal = maps:map(fun(_, Cs) -> [C || C <- Cs, maps:is_key(C, Graph)] end, Graph),
+      {SCCsRaw, _Condensed} = tarjan:condense(Internal),
+      SCCs = ?assert_type(SCCsRaw, #{type() => type()}),
+      Components = group_components(SCCs),
+      {Result, _Memo} = component_variables(maps:get(Ty, SCCs), Graph, SCCs, Components, #{}),
+      Result
+  end.
+
+%% The nodes reachable from Queue that have no cached variable set, with all
+%% their children; a cached node is not expanded.
+-spec uncached_graph([type()], #{type() => [type()]}) -> #{type() => [type()]}.
+uncached_graph([], Graph) -> Graph;
+uncached_graph([Node | Rest], Graph) ->
+  case maps:is_key(Node, Graph) orelse ets:member(?VARCACHE, Node) of
+    true -> uncached_graph(Rest, Graph);
+    false ->
+      Children = collect_node_refs(load(Node)),
+      uncached_graph(Children ++ Rest, Graph#{Node => Children})
+  end.
+
+%% The variable set of a component: what its members hold themselves, plus
+%% the sets of the components and cached nodes they refer to. Memoized over
+%% the component DAG; every member is cached with the set.
+-spec component_variables(type(), #{type() => [type()]}, #{type() => type()}, #{type() => [type()]},
+                          #{type() => sets:set(variable())}) -> {sets:set(variable()), #{type() => sets:set(variable())}}.
+component_variables(Root, Graph, SCCs, Components, Memo) ->
+  case Memo of
+    #{Root := Set} -> {Set, Memo};
+    _ ->
+      Members = maps:get(Root, Components),
+      {Set, Memo1} = lists:foldl(
+        fun(M, {Acc, Mm}) ->
+          Children = maps:get(M, Graph),
+          Own = ?TY:all_variables(load(M), maps:from_list([{C, []} || C <- Children])),
+          lists:foldl(
+            fun(C, {Acc1, Mm1}) ->
+              case Graph of
+                #{C := _} ->
+                  case maps:get(C, SCCs) of
+                    Root -> {Acc1, Mm1};
+                    ChildRoot ->
+                      {S, Mm2} = component_variables(ChildRoot, Graph, SCCs, Components, Mm1),
+                      {sets:union(S, Acc1), Mm2}
+                  end;
+                _ ->
+                  [{_, Known}] = ets:lookup(?VARCACHE, C),
+                  {sets:union(?assert_type(Known, sets:set(variable())), Acc1), Mm1}
+              end
+            end, {sets:union(Own, Acc), Mm}, Children)
+        end, {sets:new(), Memo}, Members),
+      ets:insert(?VARCACHE, [{M, Set} || M <- Members]),
+      {Set, Memo1#{Root => Set}}
+  end.
 
 -spec all_variables(type(), all_variables_cache()) -> sets:set(variable()).
 all_variables(Ty, Cache) ->
