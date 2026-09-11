@@ -20,8 +20,8 @@
 %% leaf emits ONE one-sided bound -- alpha <= single(...) or single(...) <=
 %% alpha, the NTLV rule -- which is merged into C on the spot. When the merge
 %% tightens an existing bound, the consequence that saturation would add
-%% later is itself an empty goal run right away, on the tightened pair:
-%% CL \ (CU & U) (resp. (CL | L) \ CU). The search succeeds
+%% later is itself an empty goal run right away: only the *incremental* part
+%% CL \ U (resp. L \ CU), never the accumulated pair. The search succeeds
 %% when the final continuation is reached: every line consumed, every
 %% consequence established, C saturated by construction. It fails when every
 %% alternative is refuted. The correspondence with a SAT solver:
@@ -72,7 +72,9 @@
 %% decompositions, with prunings that lose no answer. A goal achieved on the
 %% path is not redone (C already lies inside it, the other alternatives only
 %% tighten C, and any leaf below a tighter set has a solution that also
-%% satisfies C and the pending goals). A backjump skips alternatives only
+%% satisfies C and the pending goals). The consequence of a tightened pair is
+%% its incremental part: every pair (lower piece, upper piece) is covered
+%% when the later of the two arrives. A backjump skips alternatives only
 %% when the failure read no bound that the decision produced, so the same
 %% failure exists under every alternative. And a nogood is reused only where
 %% every bound it read has the same value.
@@ -239,9 +241,9 @@ line({P, N, Leaf}, S, K, Path, Env = #env{fixed = Fixed}) ->
   end.
 
 %% alpha <= U, a piece depending on Path. Tightening an existing upper bound
-%% obliges the lower bound to fit under the tightened bound: CL <= U1, an
-%% empty goal on CL \ U1 that depends on the reasons of both whole sides.
-%% Both current bounds are read.
+%% obliges the lower bound to fit under the new piece: CL <= U, an empty goal
+%% on CL \ U that depends on both pieces' reasons. Both current bounds are
+%% read.
 -spec bound_upper(variable(), ty:type(), s(), k(), reason(), env()) -> result().
 bound_upper(V, U, S = #s{c = C, reads = Reads}, K, Path, Env) ->
   Empty = ty_node:empty(),
@@ -256,14 +258,14 @@ bound_upper(V, U, S = #s{c = C, reads = Reads}, K, Path, Env) ->
           case CL of
             Empty -> K(S2);
             _ ->
-              empty(ty_node:difference(CL, U1), S2, K, maps:merge(RL, maps:merge(RU, Path)), Env)
+              empty(ty_node:difference(CL, U), S2, K, maps:merge(RL, Path), Env)
           end
       end;
     _ ->
       K(S#s{c = C#{V => {Empty, U, #{}, Path}}, reads = read(V, Empty, Any, Reads)})
   end.
 
-%% L <= alpha, symmetric: the whole lower bound must fit under the upper bound.
+%% L <= alpha, symmetric: the new lower piece must fit under the upper bound.
 -spec bound_lower(variable(), ty:type(), s(), k(), reason(), env()) -> result().
 bound_lower(V, L, S = #s{c = C, reads = Reads}, K, Path, Env) ->
   Empty = ty_node:empty(),
@@ -278,7 +280,7 @@ bound_lower(V, L, S = #s{c = C, reads = Reads}, K, Path, Env) ->
           case CU of
             Any -> K(S2);
             _ ->
-              empty(ty_node:difference(L1, CU), S2, K, maps:merge(RU, maps:merge(RL, Path)), Env)
+              empty(ty_node:difference(L, CU), S2, K, maps:merge(RU, Path), Env)
           end
       end;
     _ ->
