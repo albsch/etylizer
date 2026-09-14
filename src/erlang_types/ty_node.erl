@@ -186,14 +186,15 @@ is_empty(TyNode) ->
 %   the time to solve
 -spec is_empty(type(), S) -> {boolean(), S} when S :: is_empty_cache().
 is_empty(TyNode, LocalCache) ->
-  Ty = load(TyNode),
-
+  % keyed by the node
+  % inside a fixpoint memoized by node identity every node must come from make/1
   case LocalCache of
-    #{Ty := Res} -> {Res, LocalCache};
-    _ -> 
+    #{TyNode := Res} -> {Res, LocalCache};
+    _ ->
+      Ty = load(TyNode),
       % assume type is empty and add to state
       % N U {t}
-      {Result, LC_0} = ?TY:is_empty(Ty, LocalCache#{Ty => true}),
+      {Result, LC_0} = ?TY:is_empty(Ty, LocalCache#{TyNode => true}),
 
       case Result of 
         % empty; 
@@ -207,7 +208,7 @@ is_empty(TyNode, LocalCache) ->
         % and add Ty to be non-empty to the cache
         % we don't need to backtrack (there is no single global cache), 
         % use the LocalCache from the arguments
-        false -> {false, LocalCache#{Ty => false}}
+        false -> {false, LocalCache#{TyNode => false}}
       end
   end.
 
