@@ -2,7 +2,7 @@
 -type variable() :: ty_variable:type().
 -type monomorphic_variables() :: etally:monomorphic_variables().
 
--type is_empty_cache() :: #{type_descriptor() => boolean()}.
+-type is_empty_cache() :: #{ty_node:type() => boolean()}.
 -type normalize_cache() :: #{
     {ty_node:type(), monomorphic_variables()} => constraint_set:set_of_constraint_sets(),
     %% dnf_ty_tuple:phi_norm/4 stashes a sub-problem memo in the same threaded
