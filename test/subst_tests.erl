@@ -203,7 +203,7 @@ clean_cons_peel_test() ->
     TupA = stdtypes:ttuple([A]),
     TupAtom = stdtypes:ttuple([Atom]),
     Tab = symtab:empty(),
-    Clean = fun(Cs) -> subst:clean_cons(Cs, sets:new(), Tab) end,
+    Clean = fun(Cs) -> global_state:with_new_state(fun() -> subst:clean_cons(Cs, sets:new(), Tab) end) end,
 
     % never nested and bounded on one side only: what is left is trivially true
     [] = Clean([{A, Atom}]),
@@ -226,7 +226,9 @@ clean_cons_no_peel_test() ->
     Atom = stdtypes:tatom(),
     T = fun(X) -> stdtypes:ttuple([X]) end,
     Tab = symtab:empty(),
-    Clean = fun(Cs, Fixed) -> subst:clean_cons(Cs, sets:from_list(Fixed), Tab) end,
+    Clean = fun(Cs, Fixed) ->
+                    global_state:with_new_state(fun() -> subst:clean_cons(Cs, sets:from_list(Fixed), Tab) end)
+            end,
 
     % nested at both polarities: no best value, a is left alone
     In = [{T(A), Int}, {Atom, T(A)}],
@@ -248,7 +250,7 @@ clean_cons_dependent_body_test() ->
     None = stdtypes:tnone(),
     TupA = stdtypes:ttuple([A]),
     TupB = stdtypes:ttuple([B]),
-    Clean = fun(Cs) -> subst:clean_cons(Cs, sets:new(), symtab:empty()) end,
+    Clean = fun(Cs) -> global_state:with_new_state(fun() -> subst:clean_cons(Cs, sets:new(), symtab:empty()) end) end,
 
     % a self-reference can never be applied, so nothing peels at all
     In = [{TupA, A}, {A, Int}],
@@ -260,4 +262,25 @@ clean_cons_dependent_body_test() ->
     [{TupNone, Int}] = Clean([{A, Atom}, {A, B}, {TupB, Int}]),
     % a mutual pair: dropping one body frees the other, so b still goes
     [] = Clean([{A, B}, {B, A}]),
+    ok.
+
+%% A constraint that names a variable tally may instantiate and holds under
+%% every assignment is dropped semantically; ground ones are left to tally.
+clean_cons_valid_test() ->
+    A = stdtypes:tvar('a'),
+    Int = stdtypes:tint(),
+    IntAtom = stdtypes:tunion([Int, stdtypes:tatom()]),
+    Tab = symtab:empty(),
+    Clean = fun(Cs, Fixed) ->
+                    global_state:with_new_state(fun() -> subst:clean_cons(Cs, sets:from_list(Fixed), Tab) end)
+            end,
+
+    % holds for every a, and a is nested at both polarities, so the peel cannot
+    % remove it -- the semantic check can
+    [] = Clean([{ttuple([A, Int]), ttuple([A, IntAtom])}], []),
+    % ground, or over fixed variables only: left to tally
+    G = {ttuple([Int]), ttuple([IntAtom])},
+    [G] = Clean([G], []),
+    F = {ttuple([A, Int]), ttuple([A, IntAtom])},
+    [F] = Clean([F], ['a']),
     ok.
