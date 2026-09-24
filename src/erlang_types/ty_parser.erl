@@ -122,13 +122,23 @@ clean() ->
     undefined -> logger:info("~p state already deleted, skip clean", [?MODULE]);
     _ -> [ets:delete(T) || T <- ?ALL_ETS]
   end,
+  erlang:erase(ty_parser_installed_symtab),
   logger:debug("~p state cleaned", [?MODULE]).
 
+% Installing a symtab walks every scheme in it (replace_locs) and is called per
+% subtype check, so remember per process which symtab is installed and skip
+% the walk when it is the same one. The ETS symtab is only ever extended, so
+% a symtab installed once stays installed until clean/0.
 -spec set_symtab(symtab:t()) -> _.
 set_symtab(SymTab) ->
-  Types = symtab:get_types(SymTab),
-  % elp:ignore W0034
-  [ty_parser:extend_symtab(K, V) || {K, V} <- maps:to_list(Types)].
+  case erlang:get(ty_parser_installed_symtab) of
+    SymTab -> ok;
+    _ ->
+      Types = symtab:get_types(SymTab),
+      % elp:ignore W0034
+      [ty_parser:extend_symtab(K, V) || {K, V} <- maps:to_list(Types)],
+      erlang:put(ty_parser_installed_symtab, SymTab)
+  end.
 
 -spec parse(ast_ty()) -> type().
 parse(RawTy) ->
