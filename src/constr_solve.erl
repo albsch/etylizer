@@ -103,8 +103,17 @@ unfold_ref(Tab, Ref, Args, Loc) ->
     {ast:loc(), constr:subty_constrs()}, ok | {error, error()}) -> ok | {error, error()}.
 check_redundant_branch(_Tab, _FixedTyvars, _SubtyConstrs, _LocAndConstrs, Acc = {error, _}) -> Acc;
 check_redundant_branch(Tab, FixedTyvars, SubtyConstrs, {Loc, UnmatchedConstrs}, ok) ->
-    All = sets:union(UnmatchedConstrs, SubtyConstrs),
-    case is_satisfiable(Tab, All, FixedTyvars, "redundancy check") of
+    Redundant =
+        case closed_condition(Tab, FixedTyvars, SubtyConstrs, UnmatchedConstrs) of
+            {true, Holds} ->
+                ?METRIC(redundancy_check, {?METRIC_FUN(), closed}),
+                Holds;
+            false ->
+                ?METRIC(redundancy_check, {?METRIC_FUN(), open}),
+                All = sets:union(UnmatchedConstrs, SubtyConstrs),
+                is_satisfiable(Tab, All, FixedTyvars, "redundancy check")
+        end,
+    case Redundant of
         true ->
             ?LOG_DEBUG("Branch at ~s is redundant. Constraints that were added to the constraint above: ~s~nFixed: ~200p",
                 ast:format_loc(Loc),
@@ -117,6 +126,22 @@ check_redundant_branch(Tab, FixedTyvars, SubtyConstrs, {Loc, UnmatchedConstrs}, 
                 pretty:render_constr(UnmatchedConstrs),
                 sets:to_list(FixedTyvars)),
             ok
+    end.
+
+% A matching condition whose materializations inline to types without free variables
+% (only the fixed variables of the spec may remain) holds or fails on its own: adding it to
+% the satisfiable constraint set cannot change that. It is then decided by a subtype check
+% instead of a tally invocation over the whole constraint set.
+-spec closed_condition(symtab:t(), sets:set(ast:ty_varname()), constr:collected_constrs(), constr:collected_constrs()) ->
+    {true, boolean()} | false.
+closed_condition(Tab, FixedTyvars, SubtyConstrs, Cond) ->
+    % the variables of the condition may be materialized outside of it
+    Maters = sets:filter(fun ({scmater, _, _, _}) -> true; (_) -> false end, SubtyConstrs),
+    {Inlined, _, _, _} = gradual_utils:preprocess_constrs(sets:union(Cond, Maters), gradual_utils:new_ctx()),
+    case sets:is_subset(tyutils:free_in_subty_constrs(Inlined), FixedTyvars) of
+        false -> false;
+        true ->
+            {true, lists:all(fun ({scsubty, _, S, T}) -> subty:is_subty(Tab, S, T) end, sets:to_list(Inlined))}
     end.
 
 -spec locate_unsat_error(symtab:t(), sets:set(ast:ty_varname()), constr:simp_constrs()) ->
