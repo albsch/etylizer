@@ -57,7 +57,11 @@ clean_cons(CList, Fixed, SymTab) ->
     %% {named, _, Ref, Args} as a leaf, walking only Args with the correct
     %% polarity per parameter
     VCache = compute_variance_cache(SymTab),
-    peel(drop_trivial(CList), Fixed, VCache).
+    Peeled = peel(drop_trivial(CList), Fixed, VCache),
+    case drop_valid(Peeled, Fixed, SymTab) of
+        Peeled -> Peeled;
+        Fewer -> clean_cons(Fewer, Fixed, SymTab)
+    end.
 
 % Eliminate a non-fixed variable whose occurrences all pull in the same
 % direction. A constraint in which the variable *is* one side gives it a bound:
@@ -140,8 +144,23 @@ vars(T) -> utils:everything(fun({var, V}) when is_atom(V) -> {ok, V}; (_) -> err
 % S <: V becomes S <: S once V is peeled to S, V <: T becomes none() <: T once V
 % is peeled to none(), and with several lower bounds L_i <: V becomes
 % L_i <: L_1 | .. | L_n. Dropping them keeps their variables out of tally's input.
+%
+% A constraint that names a variable tally may instantiate is also dropped when
+% it holds under every assignment semantically: subty treats variables as
+% opaque, so subty:is_subty(S, T) is exactly that. Such a constraint still ties
+% its variables into one partition and can hold a variable at both polarities,
+% which keeps the peel from eliminating it. Ground constraints are left to
+% tally: each is its own partition anyway, and deciding them here is where the
+% time would go.
 -spec drop_trivial([{ast:ty(), ast:ty()}]) -> [{ast:ty(), ast:ty()}].
 drop_trivial(CList) -> [C || C = {S, T} <- CList, not trivial(S, T)].
+
+-spec drop_valid([{ast:ty(), ast:ty()}], sets:set(ast:ty_varname()), symtab:t()) ->
+    [{ast:ty(), ast:ty()}].
+drop_valid(CList, Fixed, SymTab) ->
+    [C || C = {S, T} <- CList,
+          not (lists:any(fun(V) -> not sets:is_element(V, Fixed) end, vars(C))
+               andalso subty:is_subty(SymTab, S, T))].
 
 -spec trivial(ast:ty(), ast:ty()) -> boolean().
 trivial({predef, none}, _) -> true;
