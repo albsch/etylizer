@@ -19,7 +19,8 @@
     mk_tally_subst/2,
     base_subst/1,
     collect_vars/5,
-    clean_cons/3
+    clean_cons/3,
+    peel_cons/3
 ]).
 
 -ifdef(TEST).
@@ -62,6 +63,15 @@ clean_cons(CList, Fixed, SymTab) ->
         Peeled -> Peeled;
         Fewer -> clean_cons(Fewer, Fixed, SymTab)
     end.
+
+% The peel and the syntactic drop alone, for constraints that decompose:step/3
+% has already taken apart. The semantic drop runs once, in clean_cons, on the
+% constraints as generated: on substituted constraints its subtype checks meet
+% the large AST types, and what a decomposition leaves behind is trivial
+% syntactically anyway.
+-spec peel_cons([{ast:ty(), ast:ty()}], sets:set(ast:ty_varname()), symtab:t()) -> [{ast:ty(), ast:ty()}].
+peel_cons(CList, Fixed, SymTab) ->
+    peel(drop_trivial(CList), Fixed, compute_variance_cache(SymTab)).
 
 % Eliminate a non-fixed variable whose occurrences all pull in the same
 % direction. A constraint in which the variable *is* one side gives it a bound:

@@ -84,7 +84,7 @@ is_satisfiable(SymTab, Constraints, FixedVars) ->
                  || C = {scsubty, _, S, T} <- sets:to_list(InlinedConstrs)])],
 
     % cleaning is OK, we only care about one solution
-    FinalCons = subst:clean_cons(InternalRawConstraints, FixedVars, SymTab),
+    FinalCons = clean(InternalRawConstraints, FixedVars, SymTab),
 
     MonomorphicTallyVariables = maps:from_list([{ty_variable:new_with_name(Var), []} || Var <- sets:to_list(FixedVars)]),
     ?METRIC(poly_vars, var_metrics(FixedVars, FinalCons, SymTab)),
@@ -108,6 +108,55 @@ is_satisfiable(SymTab, Constraints, FixedVars) ->
     end,
     ?METRIC_DO(metrics:flush_counts()),
     Result.
+
+% The peel of subst:clean_cons removes a variable once it has a bare bound, but
+% a bound hidden inside a tuple, a list or an arrow is invisible to it, and the
+% variable then looks nested at both polarities. decompose:step takes such
+% constraints apart, exactly; the peel removes the variables that exposes,
+% which makes further constraints decomposable, until a round changes nothing.
+% Overload resolution runs again in every round, because a peel can turn an
+% argument type concrete. Termination: a round either removes a variable for
+% good or replaces a constraint by constraints on its components.
+-spec clean([{ast:ty(), ast:ty()}], monomorphic_variables(), symtab:t()) -> [{ast:ty(), ast:ty()}].
+clean(Cons, FixedVars, SymTab) ->
+    rounds(subst:clean_cons(Cons, FixedVars, SymTab), FixedVars, SymTab).
+
+-spec rounds([{ast:ty(), ast:ty()}], monomorphic_variables(), symtab:t()) -> [{ast:ty(), ast:ty()}].
+rounds(Cons, FixedVars, SymTab) ->
+    Resolved = lists:flatmap(
+        fun({S, T}) ->
+            [{S2, T2} || {scsubty, _, S2, T2} <- resolve_overload(SymTab, {scsubty, ast:loc_auto(), S, T})]
+        end, Cons),
+    Decomposed = decompose:step(Resolved, FixedVars, SymTab),
+    case lists:usort(Decomposed) =:= lists:usort(Cons) of
+        true -> Cons;
+        false -> rounds(subst:peel_cons(Decomposed, FixedVars, SymTab), FixedVars, SymTab)
+    end.
+
+-spec resolve_overload(symtab:t(), constr:simp_constr_subty()) -> [constr:simp_constr_subty()].
+resolve_overload(SymTab, C = {scsubty, Loc, {intersection, FunTys}, {fun_full, ArgTys, ResTy}}) ->
+    IsClause = fun({fun_full, ParamTys, _}) -> length(ParamTys) =:= length(ArgTys); (_) -> false end,
+    case lists:all(IsClause, FunTys) of
+        false -> [C];
+        true ->
+            case [F || F = {fun_full, ParamTys, _} <- FunTys, overlaps(SymTab, ArgTys, ParamTys)] of
+                [{fun_full, ParamTys, ClauseResTy}] ->
+                    ?METRIC_COUNT(rule, overload),
+                    [{scsubty, Loc, ClauseResTy, ResTy} |
+                     [{scsubty, Loc, A, P} || {A, P} <- lists:zip(ArgTys, ParamTys)]];
+                _ -> [C]
+            end
+    end;
+resolve_overload(_SymTab, C) -> [C].
+
+-spec overlaps(symtab:t(), [ast:ty()], [ast:ty()]) -> boolean().
+overlaps(SymTab, ArgTys, ParamTys) ->
+    lists:all(
+        fun({{var, _}, _}) -> true; % nothing known about this argument
+           ({ArgTy, ParamTy}) ->
+                not subty:is_subty(SymTab, ast_lib:mk_intersection([ArgTy, ParamTy]), stdtypes:tnone())
+        end,
+        lists:zip(ArgTys, ParamTys)).
 
 -spec do_satisfiable([{ast:ty(), ast:ty()}], map()) ->
     {false, [{error, string()}]} | {true, term()}.
