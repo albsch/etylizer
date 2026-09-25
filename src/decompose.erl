@@ -13,6 +13,11 @@
 %     list(A) <: list(B)    ==  A <: B                          if A is non-empty
 %     [H @ R] <: list(B)    ==  H <: B, R <: list(B)            if H and R are non-empty
 %     P -> R <: A -> B      ==  A <: P, R <: B                  if A is non-empty
+%     #{K1 => V1} <: #{K2 => V2}  ==  K1 <: K2, V1 <: V2        if K1 and V1 are non-empty
+%
+% A map type with an empty key or value domain contains the empty map only, and
+% the empty map is in every map type, so like a list the map rule needs its left
+% side non-empty in both positions. Every map type is itself non-empty.
 %
 % The arrow rule is the one the peel needs most: a lambda passed to a polymorphic
 % higher-order function (a fold, a map) is constrained by `fun(Params) -> Body <:
@@ -75,6 +80,8 @@ rule(C = {S, T}, LBs, SymTab) ->
             end;
         {{fun_full, Ps, R}, {fun_full, As, B}} when length(Ps) =:= length(As) ->
             if_nonempty(As, lists:zip(As, Ps) ++ [{R, B}], C, LBs, SymTab);
+        {{map, [{map_field_opt, K1, V1}]}, {map, [{map_field_opt, K2, V2}]}} ->
+            if_nonempty([K1, V1], [{K1, K2}, {V1, V2}], C, LBs, SymTab);
         {{list, A}, {list, B}} -> if_nonempty([A], [{A, B}], C, LBs, SymTab);
         {{nonempty_list, A}, {list, B}} -> if_nonempty([A], [{A, B}], C, LBs, SymTab);
         {{nonempty_list, A}, {nonempty_list, B}} -> if_nonempty([A], [{A, B}], C, LBs, SymTab);
@@ -150,6 +157,11 @@ nonempty({fun_any_arg, _}, _, _, _) -> true;
 nonempty({fun_simple}, _, _, _) -> true;
 nonempty({tuple_any}, _, _, _) -> true;
 nonempty({map_any}, _, _, _) -> true;
+nonempty({map, Assocs}, LBs, SymTab, D) ->
+    % the empty map is in every map type whose required associations can be met
+    lists:all(fun({map_field_opt, _, _}) -> true;
+                 ({map_field_req, K, V}) -> nonempty(K, LBs, SymTab, D) andalso nonempty(V, LBs, SymTab, D)
+              end, Assocs);
 nonempty({predef, none}, _, _, _) -> false;
 nonempty({predef, _}, _, _, _) -> true;
 nonempty({predef_alias, _}, _, _, _) -> true;
@@ -379,6 +391,12 @@ step_test() ->
         Var = Step(Var),
         Ground = [{Scrut, {tuple, [{predef, any}, Atom]}}],
         Ground = Step(Ground),
+        % maps: an empty key or value domain would leave the empty map only
+        Map = fun(K, Val) -> {map, [{map_field_opt, K, Val}]} end,
+        [{Int, A}, {Atom, B}] = Step([{Map(Int, Atom), Map(A, B)}]),
+        StuckMap = [{Map(V, Atom), Map(A, B)}],
+        StuckMap = Step(StuckMap),
+        [{Int, V}, {V, A}, {Atom, B}] = Step([{Int, V} | StuckMap]),
         % lists and conses
         [{Int, A}] = Step([{{list, Int}, {list, A}}]),
         [{Int, A}, {{empty_list}, {list, A}}] = Step([{{cons, Int, {empty_list}}, {list, A}}]),
