@@ -12,6 +12,14 @@
 %     {S1, .., Sn} <: {T1, .., Tn}  ==  S1 <: T1, .., Sn <: Tn   if every Si is non-empty
 %     list(A) <: list(B)    ==  A <: B                          if A is non-empty
 %     [H @ R] <: list(B)    ==  H <: B, R <: list(B)            if H and R are non-empty
+%     P -> R <: A -> B      ==  A <: P, R <: B                  if A is non-empty
+%
+% The arrow rule is the one the peel needs most: a lambda passed to a polymorphic
+% higher-order function (a fold, a map) is constrained by `fun(Params) -> Body <:
+% fun(T, Acc) -> Acc`, which holds every variable of the lambda at both polarities
+% at once. Decomposed, its parameters become plain lower bounds and its body a
+% plain upper bound. With several arguments the domain is their tuple, so every
+% argument has to be non-empty.
 %
 % The side conditions are what makes the tuple and list rules exact:
 % {S1, S2} <: {T1, T2} also holds when S1 or S2 is empty, whatever T1 and T2 are.
@@ -55,6 +63,8 @@ rule(C = {S, T}, LBs, SymTab) ->
                 {ok, Ms} -> if_nonempty(Ms, lists:zip(Ms, Ts), C, LBs, SymTab);
                 none -> [C]
             end;
+        {{fun_full, Ps, R}, {fun_full, As, B}} when length(Ps) =:= length(As) ->
+            if_nonempty(As, lists:zip(As, Ps) ++ [{R, B}], C, LBs, SymTab);
         {{list, A}, {list, B}} -> if_nonempty([A], [{A, B}], C, LBs, SymTab);
         {{nonempty_list, A}, {list, B}} -> if_nonempty([A], [{A, B}], C, LBs, SymTab);
         {{nonempty_list, A}, {nonempty_list, B}} -> if_nonempty([A], [{A, B}], C, LBs, SymTab);
@@ -166,6 +176,13 @@ step_test() ->
         Empty = Step(Empty),
         % intersections of tuples are met componentwise first
         [{Int, A}] = Step([{{intersection, [{tuple, [Int]}, {tuple, [{predef, any}]}]}, {tuple, [A]}}]),
+        % arrows: the arguments of the expected type bound the parameters, the
+        % body the result; an argument variable needs a non-empty lower bound
+        Lam = {fun_full, [A, B], {tuple, [A, B]}},
+        Expected = {fun_full, [Int, V], V},
+        [{Int, A}, {V, B}, {{tuple, [A, B]}, V}] = Step([{Lam, Expected}, {Atom, V}]) -- [{Atom, V}],
+        StuckArrow = [{Lam, Expected}],
+        StuckArrow = Step(StuckArrow),
         % lists and conses
         [{Int, A}] = Step([{{list, Int}, {list, A}}]),
         [{Int, A}, {{empty_list}, {list, A}}] = Step([{{cons, Int, {empty_list}}, {list, A}}]),
