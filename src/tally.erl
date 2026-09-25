@@ -161,10 +161,45 @@ resolve_overload(SymTab, C = {scsubty, Loc, {intersection, FunTys}, {fun_full, A
                 [{fun_full, ParamTys, ClauseResTy}] ->
                     [{scsubty, Loc, ClauseResTy, ResTy} |
                      [{scsubty, Loc, A, P} || {A, P} <- lists:zip(ArgTys, ParamTys)]];
-                _ -> [C]
+                Overlapping ->
+                    case top_of_chain(SymTab, Overlapping, ArgTys) of
+                        {ok, Top} -> [{scsubty, Loc, Top, {fun_full, ArgTys, ResTy}}];
+                        none -> [C]
+                    end
             end
     end;
 resolve_overload(_SymTab, C) -> [C].
+
+% A refinement chain of clauses, P1 -> R1 with P1 <: P2 and R1 <: R2 and so on
+% (lists:usort: (nonempty_list(T)) -> nonempty_list(T); (list(T)) -> list(T)),
+% applied to a ground argument that surely holds a value outside every clause
+% but the last (here []): the intersection then applies exactly like its last
+% clause. A value of the argument at level i gets the result R_i, and R_i <: R_n,
+% so once level n is hit, R_n <: B is required and implies the others, while
+% A <: P_n is required anyway. Type variables of the spec are opaque in the chain
+% test; the argument is compared against the largest instance of P_{n-1}.
+-spec top_of_chain(symtab:t(), [ast:ty()], [ast:ty()]) -> {ok, ast:ty()} | none.
+top_of_chain(_SymTab, Clauses, _ArgTys) when length(Clauses) < 2 -> none; % nothing to drop
+top_of_chain(SymTab, Clauses, ArgTys) ->
+    Ground = lists:all(fun(A) -> sets:is_empty(tyutils:free_in_ty(A)) end, ArgTys),
+    Refines = fun({fun_full, P1, R1}, {fun_full, P2, R2}) ->
+        subty:is_subty(SymTab, {tuple, P1}, {tuple, P2}) andalso subty:is_subty(SymTab, R1, R2)
+    end,
+    Chain = Ground andalso lists:all(fun({F1, F2}) -> Refines(F1, F2) end,
+                                     lists:zip(lists:droplast(Clauses), tl(Clauses))),
+    case Chain of
+        false -> none;
+        true ->
+            Top = {fun_full, _, _} = lists:last(Clauses),
+            {fun_full, PBelow, _} = lists:last(lists:droplast(Clauses)),
+            Largest = utils:everywhere(fun({var, V}) when is_atom(V) -> {ok, {predef, any}}; (_) -> error end,
+                                       {tuple, PBelow}),
+            Outside = ast_lib:mk_intersection([{tuple, ArgTys}, ast_lib:mk_negation(Largest)]),
+            case subty:is_subty(SymTab, Outside, {predef, none}) of
+                true -> none;       % the argument might stay inside the refinements
+                false -> {ok, Top}
+            end
+    end.
 
 -spec overlaps(symtab:t(), [ast:ty()], [ast:ty()]) -> boolean().
 overlaps(SymTab, ArgTys, ParamTys) ->
@@ -292,6 +327,23 @@ uf_union(A, B, Parent) ->
     end.
 
 -ifdef(TEST).
+
+chain_test() ->
+    global_state:with_new_state(fun() ->
+        T = tvar('T'), B = tvar('B'),
+        Usort = {intersection, [{fun_full, [{nonempty_list, T}], {nonempty_list, T}},
+                                {fun_full, [{list, T}], {list, T}}]},
+        Ground = {list, stdtypes:tatom()},
+        % list(atom()) holds [], which no nonempty_list(T) does: the last clause applies
+        [{scsubty, _, {fun_full, [{list, T}], {list, T}}, {fun_full, [Ground], B}}] =
+            resolve_overload(symtab:empty(), {scsubty, ast:loc_auto(), Usort, {fun_full, [Ground], B}}),
+        % a non-empty list may sit inside the first clause for some T: untouched
+        C2 = {scsubty, ast:loc_auto(), Usort, {fun_full, [{nonempty_list, stdtypes:tatom()}], B}},
+        [C2] = resolve_overload(symtab:empty(), C2),
+        % an argument with a variable: untouched
+        C3 = {scsubty, ast:loc_auto(), Usort, {fun_full, [{list, B}], B}},
+        [C3] = resolve_overload(symtab:empty(), C3)
+    end).
 
 partition_test() ->
     A = tvar('A'), B = tvar('B'),
