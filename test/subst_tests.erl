@@ -193,3 +193,71 @@ clean_negate_var_test() ->
 %
 %     end).
 %
+
+%% clean_cons eliminates a non-fixed variable whose nested occurrences all pull
+%% in the same direction, replacing it by one of its own bounds.
+clean_cons_peel_test() ->
+    A = stdtypes:tvar('a'),
+    Atom = stdtypes:tatom(),
+    Int = stdtypes:tint(),
+    TupA = stdtypes:ttuple([A]),
+    TupAtom = stdtypes:ttuple([Atom]),
+    Tab = symtab:empty(),
+    Clean = fun(Cs) -> subst:clean_cons(Cs, sets:new(), Tab) end,
+
+    % never nested and bounded on one side only: what is left is trivially true
+    [] = Clean([{A, Atom}]),
+    [] = Clean([{Atom, A}]),
+    % never nested and bounded on both sides: a is eliminated by transitivity
+    [{Atom, Int}] = Clean([{Atom, A}, {A, Int}]),
+    % nested covariantly: the union of the lower bounds is the only choice
+    [{TupAtom, Int}] = Clean([{Atom, A}, {TupA, Int}]),
+    % nested contravariantly: the intersection of the upper bounds
+    [{Int, TupAtom}] = Clean([{A, Atom}, {Int, TupA}]),
+    % several lower bounds: a becomes their union, and each bound is then a
+    % member of the union it is compared with, which is trivially true as well
+    [{{tuple, [{union, U}]}, Int}] = Clean([{Atom, A}, {Int, A}, {TupA, Int}]),
+    [Atom, Int] = lists:sort(U),
+    ok.
+
+clean_cons_no_peel_test() ->
+    A = stdtypes:tvar('a'),
+    Int = stdtypes:tint(),
+    Atom = stdtypes:tatom(),
+    T = fun(X) -> stdtypes:ttuple([X]) end,
+    Tab = symtab:empty(),
+    Clean = fun(Cs, Fixed) -> subst:clean_cons(Cs, sets:from_list(Fixed), Tab) end,
+
+    % nested at both polarities: no best value, a is left alone
+    In = [{T(A), Int}, {Atom, T(A)}],
+    In = Clean(In, []),
+    % fixed variables are never peeled
+    In2 = [{A, Atom}],
+    In2 = Clean(In2, ['a']),
+    ok.
+
+%% The substitution is simultaneous, so a body may not name a variable that is
+%% substituted in the same round -- but naming one whose own body was dropped is
+%% harmless, because that variable stays as it is. A body that has to wait is
+%% picked up by a later round.
+clean_cons_dependent_body_test() ->
+    A = stdtypes:tvar('a'),
+    B = stdtypes:tvar('b'),
+    Atom = stdtypes:tatom(),
+    Int = stdtypes:tint(),
+    None = stdtypes:tnone(),
+    TupA = stdtypes:ttuple([A]),
+    TupB = stdtypes:ttuple([B]),
+    Clean = fun(Cs) -> subst:clean_cons(Cs, sets:new(), symtab:empty()) end,
+
+    % a self-reference can never be applied, so nothing peels at all
+    In = [{TupA, A}, {A, Int}],
+    In = Clean(In),
+    % b's body is a, and a is substituted in round 1, so b waits; round 2 sees
+    % b's lower bound as none() and peels b as well. Only the constraint that
+    % is not trivially true by then survives.
+    TupNone = stdtypes:ttuple([None]),
+    [{TupNone, Int}] = Clean([{A, Atom}, {A, B}, {TupB, Int}]),
+    % a mutual pair: dropping one body frees the other, so b still goes
+    [] = Clean([{A, B}, {B, A}]),
+    ok.
