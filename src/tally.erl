@@ -83,7 +83,7 @@ is_satisfiable(SymTab, Constraints, FixedVars) ->
                  || C = {scsubty, _, S, T} <- sets:to_list(InlinedConstrs)])],
 
     % cleaning is OK, we only care about one solution
-    FinalCons = subst:clean_cons(InternalRawConstraints, FixedVars, SymTab),
+    FinalCons = clean(InternalRawConstraints, FixedVars, SymTab),
 
     MonomorphicTallyVariables = maps:from_list([{ty_variable:new_with_name(Var), []} || Var <- sets:to_list(FixedVars)]),
     ?METRIC(poly_vars, var_metrics(FixedVars, FinalCons, SymTab)),
@@ -102,6 +102,30 @@ is_satisfiable(SymTab, Constraints, FixedVars) ->
             lists:foldl(fun(_, {false, _}) -> {false, []};
                            (C, {true, _}) -> do_satisfiable(C, MonomorphicTallyVariables)
                         end, FirstRes, Rest)
+    end.
+
+% The peel of subst:clean_cons removes a variable once it has a bare bound, but
+% a bound hidden inside a tuple, a list or an arrow is invisible to it, and the
+% variable then looks nested at both polarities. decompose:step takes such
+% constraints apart, exactly; the peel removes the variables that exposes,
+% which makes further constraints decomposable, until a round changes nothing.
+% Overload resolution runs again in every round, because a peel can turn an
+% argument type concrete. Termination: a round either removes a variable for
+% good or replaces a constraint by constraints on its components.
+-spec clean([{ast:ty(), ast:ty()}], monomorphic_variables(), symtab:t()) -> [{ast:ty(), ast:ty()}].
+clean(Cons, FixedVars, SymTab) ->
+    rounds(subst:clean_cons(Cons, FixedVars, SymTab), FixedVars, SymTab).
+
+-spec rounds([{ast:ty(), ast:ty()}], monomorphic_variables(), symtab:t()) -> [{ast:ty(), ast:ty()}].
+rounds(Cons, FixedVars, SymTab) ->
+    Resolved = lists:flatmap(
+        fun({S, T}) ->
+            [{S2, T2} || {scsubty, _, S2, T2} <- resolve_overload(SymTab, {scsubty, ast:loc_auto(), S, T})]
+        end, Cons),
+    Decomposed = decompose:step(Resolved, FixedVars, SymTab),
+    case lists:usort(Decomposed) =:= lists:usort(Cons) of
+        true -> Cons;
+        false -> rounds(subst:peel_cons(Decomposed, FixedVars, SymTab), FixedVars, SymTab)
     end.
 
 -spec do_satisfiable([{ast:ty(), ast:ty()}], map()) ->
