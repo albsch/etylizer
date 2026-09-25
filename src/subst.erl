@@ -104,7 +104,7 @@ peel(CList, Fixed, VCache) ->
         {#{}, #{}}, CList),
     % highest name first: any fixed order does, and this one is deterministic
     Vars = lists:reverse(lists:usort([V || {V, _} <- maps:keys(Bounds)] ++ maps:keys(Nested))),
-    Bodies = [{V, B, vars(B)} || V <- Vars, B <- [body(V, Bounds, Nested)], B =/= keep],
+    Bodies = [{V, B, vars(B)} || V <- Vars, B <- [recursive_body(V, body(V, Bounds, Nested), Nested)], B =/= keep],
     {Subst, _} = lists:foldl(
         fun({V, B, Named}, Acc = {S, Taken}) ->
             case lists:member(V, Named ++ Taken) orelse lists:any(fun(W) -> maps:is_key(W, S) end, Named) of
@@ -145,6 +145,49 @@ body(V, Bounds, Nested) ->
         _ -> keep
     end.
 
+% A body that names its own variable is the shape of an accumulator: the lower
+% bounds of the result of a fold are the initial value and the results of the
+% folded function, which are built from the accumulator itself. If every nested
+% occurrence of V is covariant and every self-reference sits under a type
+% constructor, the least solution of  body(V) <: V  is the least fixpoint
+% mu X. body(X): the map V -> body(V) is monotone, so every solution A has
+% body(A) <: A and hence mu <: A (Knaster-Tarski), and every other constraint is
+% monotone in V or an upper bound of V, so it keeps holding for mu. Like the
+% peel of a non-recursive covariant variable, this takes the smallest admissible
+% value and is exact for satisfiability. The guard makes the mu type contractive.
+-spec recursive_body(ast:ty_varname(), ast:ty() | keep, #{ast:ty_varname() => [0 | 1]}) -> ast:ty() | keep.
+recursive_body(_V, keep, _Nested) -> keep;
+recursive_body(V, B, Nested) ->
+    case lists:member(V, vars(B)) of
+        false -> B;
+        true ->
+            case maps:get(V, Nested, []) =:= [0] andalso guarded(V, B, false) of
+                true ->
+                    X = {mu_var, list_to_atom("$mu_" ++ atom_to_list(V))},
+                    {mu, X, apply_base(#{V => X}, B)};
+                false -> keep
+            end
+    end.
+
+% every occurrence of V in T is below a tuple, cons, list, fun or map constructor
+-spec guarded(ast:ty_varname(), ast:ty(), boolean()) -> boolean().
+guarded(V, {var, V}, Guarded) -> Guarded;
+guarded(_, {var, _}, _) -> true;
+guarded(V, {union, Ts}, G) -> lists:all(fun(T) -> guarded(V, T, G) end, Ts);
+guarded(V, {intersection, Ts}, G) -> lists:all(fun(T) -> guarded(V, T, G) end, Ts);
+guarded(V, {negation, T}, G) -> guarded(V, T, G);
+guarded(V, {tuple, Ts}, _) -> lists:all(fun(T) -> guarded(V, T, true) end, Ts);
+guarded(V, {cons, A, B}, _) -> guarded(V, A, true) andalso guarded(V, B, true);
+guarded(V, {list, A}, _) -> guarded(V, A, true);
+guarded(V, {nonempty_list, A}, _) -> guarded(V, A, true);
+guarded(V, {improper_list, A, B}, _) -> guarded(V, A, true) andalso guarded(V, B, true);
+guarded(V, {nonempty_improper_list, A, B}, _) -> guarded(V, A, true) andalso guarded(V, B, true);
+guarded(V, {fun_full, As, R}, _) -> lists:all(fun(T) -> guarded(V, T, true) end, [R | As]);
+guarded(V, {fun_any_arg, R}, _) -> guarded(V, R, true);
+guarded(V, {map, Assocs}, _) -> lists:all(fun({_, K, Val}) -> guarded(V, K, true) andalso guarded(V, Val, true) end, Assocs);
+guarded(V, {mu, _, T}, G) -> guarded(V, T, G);
+guarded(V, T, _) -> not lists:member(V, vars(T)).
+
 -spec vars(term()) -> [ast:ty_varname()].
 vars(T) -> utils:everything(fun({var, V}) when is_atom(V) -> {ok, V}; (_) -> error end, T).
 
@@ -175,7 +218,14 @@ drop_valid(CList, Fixed, SymTab) ->
 -spec trivial(ast:ty(), ast:ty()) -> boolean().
 trivial({predef, none}, _) -> true;
 trivial(_, {predef, any}) -> true;
-trivial(S, T) ->
+trivial(S, T = {mu, X, Body}) ->
+    % what a recursive peel leaves behind: L_i <: mu X. (L_1 | .. | L_n)[X]
+    Unfolded = utils:everywhere(fun(Y) when Y =:= X -> {ok, T}; (_) -> error end, Body),
+    members(union, S) -- members(union, Unfolded) =:= [] orelse trivial_plain(S, T);
+trivial(S, T) -> trivial_plain(S, T).
+
+-spec trivial_plain(ast:ty(), ast:ty()) -> boolean().
+trivial_plain(S, T) ->
     members(union, S) -- members(union, T) =:= []
         orelse members(intersection, T) -- members(intersection, S) =:= [].
 

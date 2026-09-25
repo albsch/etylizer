@@ -252,9 +252,8 @@ clean_cons_dependent_body_test() ->
     TupB = stdtypes:ttuple([B]),
     Clean = fun(Cs) -> global_state:with_new_state(fun() -> subst:clean_cons(Cs, sets:new(), symtab:empty()) end) end,
 
-    % a self-reference can never be applied, so nothing peels at all
-    In = [{TupA, A}, {A, Int}],
-    In = Clean(In),
+    % a self-reference under a constructor is peeled to a recursive type
+    [{{mu, X, {tuple, [X]}}, Int}] = Clean([{TupA, A}, {A, Int}]),
     % b's body is a, and a is substituted in round 1, so b waits; round 2 sees
     % b's lower bound as none() and peels b as well. Only the constraint that
     % is not trivially true by then survives.
@@ -283,4 +282,27 @@ clean_cons_valid_test() ->
     [G] = Clean([G], []),
     F = {ttuple([A, Int]), ttuple([A, IntAtom])},
     [F] = Clean([F], ['a']),
+    ok.
+
+%% A variable whose lower bounds mention it is an accumulator; nested only
+%% covariantly, it becomes the least fixpoint of its bounds and the bounds
+%% themselves become trivial.
+clean_cons_recursive_test() ->
+    A = stdtypes:tvar('a'),
+    Int = stdtypes:tint(),
+    Nil = stdtypes:tempty_list(),
+    Clean = fun(Cs) -> global_state:with_new_state(fun() -> subst:clean_cons(Cs, sets:new(), symtab:empty()) end) end,
+
+    % [] <: a, [int | a] <: a, a <: list(int): a := mu X. [] | [int | X]
+    [{{mu, X, Body}, {list, Int}}] = Clean([{Nil, A}, {{cons, Int, A}, A}, {A, {list, Int}}]),
+    {mu_var, _} = X,
+    {union, Members} = Body,
+    true = lists:member(Nil, Members),
+    true = lists:member({cons, Int, X}, Members),
+    % a self-reference that is not under a constructor is left alone
+    In = [{Nil, A}, {{union, [A, Int]}, A}, {A, {list, Int}}],
+    In = Clean(In),
+    % a contravariant occurrence elsewhere leaves it alone as well
+    In2 = [{Nil, A}, {{cons, Int, A}, A}, {{fun_full, [A], Int}, {fun_full, [Nil], Int}}],
+    In2 = Clean(In2),
     ok.
