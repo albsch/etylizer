@@ -57,19 +57,102 @@ clean_cons(CList, Fixed, SymTab) ->
     %% {named, _, Ref, Args} as a leaf, walking only Args with the correct
     %% polarity per parameter
     VCache = compute_variance_cache(SymTab),
-    VarPositions = collect_vars_clist(CList, 0, #{}, Fixed, VCache),
+    peel(drop_trivial(CList), Fixed, VCache).
 
-    Apply = fun(Ty) -> maps:fold(
-        fun(VariableName, VariablePositions, Tyy) ->
-            case lists:usort(VariablePositions) of
-                [0] -> apply_base(#{VariableName => {predef, none}}, Tyy);
-                [1] -> apply_base(#{VariableName => {predef, any}}, Tyy);
-                _ -> Tyy
+% Eliminate a non-fixed variable whose occurrences all pull in the same
+% direction. A constraint in which the variable *is* one side gives it a bound:
+% `S <: V` a lower bound S, `V <: T` an upper bound T. Every other occurrence is
+% nested, and collect_vars reports with which polarity. If the nested
+% occurrences are all covariant, the smallest admissible value is the best one
+% everywhere, so
+%
+%     V := union(lower bounds of V)
+%
+% preserves satisfiability: the lower bounds then hold trivially, the upper
+% bounds by transitivity (union(Lowers) <: A <: T for any solution A), and every
+% nested covariant occurrence only got smaller. Dually, all-contravariant nested
+% occurrences allow V := intersection(upper bounds of V). A variable that is
+% never nested may take either side; the one with fewer bounds leaves fewer and
+% smaller constraints behind. A variable nested at both polarities has no best
+% value and is left alone. With no bounds at all this is the clean it replaces:
+% a variable used only covariantly becomes none(), one used only
+% contravariantly any().
+%
+% The substitution of a round is simultaneous, so a body may not name a
+% variable substituted in the same round, itself included; a variable that has
+% to wait is picked up by a later round. Every round removes its variables from
+% the constraints for good, so the rounds terminate.
+-spec peel([{ast:ty(), ast:ty()}], sets:set(ast:ty_varname()), variance_cache()) ->
+    [{ast:ty(), ast:ty()}].
+peel(CList, Fixed, VCache) ->
+    {Bounds, Nested} = lists:foldl(
+        fun({S, T}, Acc) -> side(T, S, 1, side(S, T, 0, Acc, Fixed, VCache), Fixed, VCache) end,
+        {#{}, #{}}, CList),
+    % highest name first: any fixed order does, and this one is deterministic
+    Vars = lists:reverse(lists:usort([V || {V, _} <- maps:keys(Bounds)] ++ maps:keys(Nested))),
+    Bodies = [{V, B, vars(B)} || V <- Vars, B <- [body(V, Bounds, Nested)], B =/= keep],
+    {Subst, _} = lists:foldl(
+        fun({V, B, Named}, Acc = {S, Taken}) ->
+            case lists:member(V, Named ++ Taken) orelse lists:any(fun(W) -> maps:is_key(W, S) end, Named) of
+                true -> Acc;
+                false -> {S#{V => B}, Named ++ Taken}
             end
-        end, Ty, VarPositions)
-            end,
+        end, {#{}, []}, Bodies),
+    case map_size(Subst) of
+        0 -> CList;
+        _ -> peel(drop_trivial([{apply_base(Subst, S), apply_base(Subst, T)} || {S, T} <- CList]),
+                  Fixed, VCache)
+    end.
 
-    [{Apply(C1), Apply(C2)} || {C1, C2} <- CList].
+% One side of a constraint, CPos 0 for the left and 1 for the right side. A bare
+% non-fixed variable is a bound and not an occurrence: the other side bounds it,
+% from above in `V <: T` and from below in `S <: V`. Every other side contributes
+% the polarities of the variables nested in it, which is what collect_vars walks.
+-spec side(ast:ty(), ast:ty(), 0 | 1, Acc, sets:set(ast:ty_varname()), variance_cache()) -> Acc
+    when Acc :: {#{{ast:ty_varname(), 0 | 1} => [ast:ty()]}, #{ast:ty_varname() => [0 | 1]}}.
+side({var, V}, Other, CPos, Acc = {B, N}, Fixed, _VCache) ->
+    case sets:is_element(V, Fixed) of
+        true -> Acc;
+        false -> {maps:update_with({V, CPos}, fun(L) -> [Other | L] end, [Other], B), N}
+    end;
+side(Ty, _Other, CPos, {B, N}, Fixed, VCache) ->
+    {B, collect_vars(Ty, CPos, N, Fixed, VCache)}.
+
+-spec body(ast:ty_varname(), #{{ast:ty_varname(), 0 | 1} => [ast:ty()]},
+           #{ast:ty_varname() => [0 | 1]}) -> ast:ty() | keep.
+body(V, Bounds, Nested) ->
+    Uppers = maps:get({V, 0}, Bounds, []),
+    Lowers = maps:get({V, 1}, Bounds, []),
+    case maps:get(V, Nested, []) of
+        [0] -> ast_lib:mk_union(lists:usort(Lowers));
+        [1] -> ast_lib:mk_intersection(lists:usort(Uppers));
+        [] when length(Uppers) =< length(Lowers) -> ast_lib:mk_intersection(lists:usort(Uppers));
+        [] -> ast_lib:mk_union(lists:usort(Lowers));
+        _ -> keep
+    end.
+
+-spec vars(term()) -> [ast:ty_varname()].
+vars(T) -> utils:everything(fun({var, V}) when is_atom(V) -> {ok, V}; (_) -> error end, T).
+
+% none() <: T, S <: any(), and S <: T where every member of S (read as a union)
+% is a member of T, or every member of T (read as an intersection) is a member
+% of S, hold under every assignment. They are what a peeled bound leaves behind:
+% S <: V becomes S <: S once V is peeled to S, V <: T becomes none() <: T once V
+% is peeled to none(), and with several lower bounds L_i <: V becomes
+% L_i <: L_1 | .. | L_n. Dropping them keeps their variables out of tally's input.
+-spec drop_trivial([{ast:ty(), ast:ty()}]) -> [{ast:ty(), ast:ty()}].
+drop_trivial(CList) -> [C || C = {S, T} <- CList, not trivial(S, T)].
+
+-spec trivial(ast:ty(), ast:ty()) -> boolean().
+trivial({predef, none}, _) -> true;
+trivial(_, {predef, any}) -> true;
+trivial(S, T) ->
+    members(union, S) -- members(union, T) =:= []
+        orelse members(intersection, T) -- members(intersection, S) =:= [].
+
+-spec members(union | intersection, ast:ty()) -> [ast:ty()].
+members(K, {K, Tys}) -> Tys;
+members(_, Ty) -> [Ty].
 
 -type clean_mode() :: {clean, symtab:t()} | no_clean.
 
@@ -288,18 +371,6 @@ merge_pol(unused, X) -> X;
 merge_pol(X, unused) -> X;
 merge_pol(X, X) -> X;
 merge_pol(_, _) -> inv.
-
-% Walks a list of subtype constraints; for each {C1, C2}, C1 is in covariant
-% (CPos) and C2 in contravariant (1-CPos) position. 
-% Thread the accumulator through the recursive walks instead of restarting each
-% branch from Pos and merging the subtrees afterwards. Recording a polarity for
-% a variable is idempotent, so the result is the same, but a wide union or
-% intersection no longer costs a map merge per component.
-collect_vars_clist(L, CPos, Pos, Fix, VCache) when is_list(L) ->
-    lists:foldl(fun({C1, C2}, Acc) ->
-        Acc1 = collect_vars(C1, CPos, Acc, Fix, VCache),
-        collect_vars(C2, 1 - CPos, Acc1, Fix, VCache)
-                end, Pos, L).
 
 -spec collect_vars(ast:ty() | {ty_hole}, 0 | 1, #{ast:ty_varname() => [0 | 1]},
                    sets:set(ast:ty_varname()), variance_cache()) ->
