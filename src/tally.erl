@@ -172,33 +172,75 @@ resolve_overload(_SymTab, C) -> [C].
 
 % A refinement chain of clauses, P1 -> R1 with P1 <: P2 and R1 <: R2 and so on
 % (lists:usort: (nonempty_list(T)) -> nonempty_list(T); (list(T)) -> list(T)),
-% applied to a ground argument that surely holds a value outside every clause
-% but the last (here []): the intersection then applies exactly like its last
-% clause. A value of the argument at level i gets the result R_i, and R_i <: R_n,
+% applied to an argument that surely holds a value outside every clause but the
+% last (here []): the intersection then applies exactly like its last clause. A value of the argument at level i gets the result R_i, and R_i <: R_n,
 % so once level n is hit, R_n <: B is required and implies the others, while
 % A <: P_n is required anyway. Type variables of the spec are opaque in the chain
-% test; the argument is compared against the largest instance of P_{n-1}.
+% test; the smallest instance of the argument is compared against the largest
+% instance of P_{n-1}, so the witness exists under every assignment.
 -spec top_of_chain(symtab:t(), [ast:ty()], [ast:ty()]) -> {ok, ast:ty()} | none.
 top_of_chain(_SymTab, Clauses, _ArgTys) when length(Clauses) < 2 -> none; % nothing to drop
 top_of_chain(SymTab, Clauses, ArgTys) ->
-    Ground = lists:all(fun(A) -> sets:is_empty(tyutils:free_in_ty(A)) end, ArgTys),
-    Refines = fun({fun_full, P1, R1}, {fun_full, P2, R2}) ->
-        subty:is_subty(SymTab, {tuple, P1}, {tuple, P2}) andalso subty:is_subty(SymTab, R1, R2)
-    end,
-    Chain = Ground andalso lists:all(fun({F1, F2}) -> Refines(F1, F2) end,
-                                     lists:zip(lists:droplast(Clauses), tl(Clauses))),
-    case Chain of
-        false -> none;
-        true ->
-            Top = {fun_full, _, _} = lists:last(Clauses),
-            {fun_full, PBelow, _} = lists:last(lists:droplast(Clauses)),
-            Largest = utils:everywhere(fun({var, V}) when is_atom(V) -> {ok, {predef, any}}; (_) -> error end,
-                                       {tuple, PBelow}),
-            Outside = ast_lib:mk_intersection([{tuple, ArgTys}, ast_lib:mk_negation(Largest)]),
-            case subty:is_subty(SymTab, Outside, {predef, none}) of
-                true -> none;       % the argument might stay inside the refinements
-                false -> {ok, Top}
+    % the witness has to exist for every instance of the argument: look for it
+    % in the smallest one (variables at covariant positions none(), at
+    % contravariant positions any()), which is below every instance
+    case smallest_instance({tuple, ArgTys}, 0) of
+        none -> none;
+        {ok, Smallest} ->
+            Refines = fun({fun_full, P1, R1}, {fun_full, P2, R2}) ->
+                subty:is_subty(SymTab, {tuple, P1}, {tuple, P2}) andalso subty:is_subty(SymTab, R1, R2)
+            end,
+            Chain = lists:all(fun({F1, F2}) -> Refines(F1, F2) end,
+                              lists:zip(lists:droplast(Clauses), tl(Clauses))),
+            case Chain of
+                false -> none;
+                true ->
+                    Top = {fun_full, _, _} = lists:last(Clauses),
+                    {fun_full, PBelow, _} = lists:last(lists:droplast(Clauses)),
+                    Largest = utils:everywhere(fun({var, V}) when is_atom(V) -> {ok, {predef, any}}; (_) -> error end,
+                                               {tuple, PBelow}),
+                    Outside = ast_lib:mk_intersection([Smallest, ast_lib:mk_negation(Largest)]),
+                    case subty:is_subty(SymTab, Outside, {predef, none}) of
+                        true -> none;       % the argument might stay inside the refinements
+                        false -> {ok, Top}
+                    end
             end
+    end.
+
+% The smallest instance of a type over all assignments of its variables:
+% none() at covariant, any() at contravariant positions. A named type with
+% variables among its arguments has unknown variance and gives none.
+-spec smallest_instance(ast:ty(), 0 | 1) -> {ok, ast:ty()} | none.
+smallest_instance({var, V}, 0) when is_atom(V) -> {ok, {predef, none}};
+smallest_instance({var, V}, 1) when is_atom(V) -> {ok, {predef, any}};
+smallest_instance({tuple, Ts}, P) -> smallest_list(Ts, P, fun(L) -> {tuple, L} end);
+smallest_instance({union, Ts}, P) -> smallest_list(Ts, P, fun(L) -> {union, L} end);
+smallest_instance({intersection, Ts}, P) -> smallest_list(Ts, P, fun(L) -> {intersection, L} end);
+smallest_instance({list, A}, P) -> smallest_list([A], P, fun([X]) -> {list, X} end);
+smallest_instance({nonempty_list, A}, P) -> smallest_list([A], P, fun([X]) -> {nonempty_list, X} end);
+smallest_instance({cons, H, R}, P) -> smallest_list([H, R], P, fun([X, Y]) -> {cons, X, Y} end);
+smallest_instance({negation, T}, P) ->
+    case smallest_instance(T, 1 - P) of {ok, X} -> {ok, {negation, X}}; none -> none end;
+smallest_instance({fun_full, As, R}, P) ->
+    case {smallest_list(As, 1 - P, fun(L) -> L end), smallest_instance(R, P)} of
+        {{ok, As2}, {ok, R2}} -> {ok, {fun_full, As2, R2}};
+        _ -> none
+    end;
+smallest_instance({map, Assocs}, P) ->
+    Rs = [{K, smallest_instance(KT, P), smallest_instance(VT, P)} || {K, KT, VT} <- Assocs],
+    case lists:all(fun({_, {ok, _}, {ok, _}}) -> true; (_) -> false end, Rs) of
+        true -> {ok, {map, [{K, KT, VT} || {K, {ok, KT}, {ok, VT}} <- Rs]}};
+        false -> none
+    end;
+smallest_instance(T, _) ->
+    case sets:is_empty(tyutils:free_in_ty(T)) of true -> {ok, T}; false -> none end.
+
+-spec smallest_list([ast:ty()], 0 | 1, fun(([ast:ty()]) -> ast:ty() | [ast:ty()])) -> {ok, ast:ty() | [ast:ty()]} | none.
+smallest_list(Ts, P, Build) ->
+    Rs = [smallest_instance(T, P) || T <- Ts],
+    case lists:all(fun({ok, _}) -> true; (none) -> false end, Rs) of
+        true -> {ok, Build([X || {ok, X} <- Rs])};
+        false -> none
     end.
 
 -spec overlaps(symtab:t(), [ast:ty()], [ast:ty()]) -> boolean().
@@ -340,9 +382,12 @@ chain_test() ->
         % a non-empty list may sit inside the first clause for some T: untouched
         C2 = {scsubty, ast:loc_auto(), Usort, {fun_full, [{nonempty_list, stdtypes:tatom()}], B}},
         [C2] = resolve_overload(symtab:empty(), C2),
-        % an argument with a variable: untouched
-        C3 = {scsubty, ast:loc_auto(), Usort, {fun_full, [{list, B}], B}},
-        [C3] = resolve_overload(symtab:empty(), C3)
+        % list(B) holds [] for every B: resolved as well
+        [{scsubty, _, {fun_full, [{list, T}], {list, T}}, _}] =
+            resolve_overload(symtab:empty(), {scsubty, ast:loc_auto(), Usort, {fun_full, [{list, B}], B}}),
+        % nonempty_list(B) may be empty (B = none()): no witness, untouched
+        C4 = {scsubty, ast:loc_auto(), Usort, {fun_full, [{nonempty_list, B}], B}},
+        [C4] = resolve_overload(symtab:empty(), C4)
     end).
 
 partition_test() ->
