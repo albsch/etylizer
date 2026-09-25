@@ -197,13 +197,23 @@ combine_vars(_K, V1, V2) ->
 -type variance_cache() :: #{ symtab_ty_key() => [variance()] }.
 -type symtab_ty_key() :: {ty_key, atom(), atom(), arity()}.
 
+%% The cache depends on the types of the symtab only. clean_cons computes it once
+%% per tally invocation, with a symtab that is extended per function by a fun env
+%% but keeps its types map, so remember the last result per process, keyed on
+%% that map. Matching the key against the same term is a pointer comparison.
 -spec compute_variance_cache(symtab:t()) -> variance_cache().
 compute_variance_cache(SymTab) ->
     Types = symtab:get_types(SymTab),
-    Initial = maps:map(
-        fun(_, {ty_scheme, Vars, _}) -> [unused || _ <- Vars] end,
-        Types),
-    variance_fixpoint(Initial, Types).
+    case erlang:get(subst_variance_cache) of
+        {Types, Cache} -> Cache;
+        _ ->
+            Initial = maps:map(
+                fun(_, {ty_scheme, Vars, _}) -> [unused || _ <- Vars] end,
+                Types),
+            Cache = variance_fixpoint(Initial, Types),
+            erlang:put(subst_variance_cache, {Types, Cache}),
+            Cache
+    end.
 
 -spec variance_fixpoint(variance_cache(), map()) -> variance_cache().
 variance_fixpoint(OldCache, Types) ->
