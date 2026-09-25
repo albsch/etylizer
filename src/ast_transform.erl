@@ -228,7 +228,11 @@ trans_spec_ty(Ctx, Loc, FunTys) ->
             [T] -> T;
             _ -> {intersection, Tys}
         end,
-    TyVars = varenv:range(Env),
+    % Bind the variables in the order of their first occurrence. varenv:range/1
+    % follows the map's internal order, which for atoms is their creation order
+    % in this VM, so it differs between runs; the symtab cache stores these
+    % schemes across runs and needs the same spec to give the same scheme.
+    TyVars = lists:uniq([V || {var, _, V} <- AllTyvars]),
     ConstrainedTyVars =
         lists:map(
                 fun(Alpha) ->
@@ -280,12 +284,21 @@ resolve_ety_ty(_, intersection, Tys) ->
         _ -> {intersection, Tys}
     end;
 resolve_ety_ty(_, without, [T, U]) -> {intersection, [T, {negation, U}]};
-resolve_ety_ty(_, mu, [Body]) ->
-    Name = list_to_atom("$mu_" ++ integer_to_list(erlang:unique_integer([positive]))),
+resolve_ety_ty(L, mu, [Body]) ->
+    Name = mu_name(L),
     {mu, {mu_var, Name}, replace_mu_var(Body, Name)};
 resolve_ety_ty(_, mu_var, []) -> {mu_var, '$mu_placeholder'};
 resolve_ety_ty(L, Name, _) ->
     errors:ty_error(L, "Invalid use of builtin type etylizer:~w", Name).
+
+% The binder of an etylizer:mu(...) is named after its location: the same
+% source then yields the same AST in every run, which the symtab cache relies
+% on when it stores these types across runs, and binders of different files
+% never share a name.
+-spec mu_name(ast:loc()) -> atom().
+mu_name({loc, File, Line, Col}) ->
+    list_to_atom(lists:flatten(
+        io_lib:format("$mu_~s_~p_~p_~p", [filename:basename(File), Line, Col, erlang:phash2(File)]))).
 
 -spec replace_mu_var(ast:ty(), atom()) -> ast:ty().
 replace_mu_var({mu_var, '$mu_placeholder'}, Name) -> {mu_var, Name};

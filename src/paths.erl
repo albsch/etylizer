@@ -6,6 +6,7 @@
     compute_search_path/1,
     generate_input_file_list/1,
     index_file_name/1,
+    symtab_cache_file_name/1,
     find_module_path/2,
     rebar_lock_file/1,
     rebar_config_from_lock_file/1
@@ -66,6 +67,10 @@ compute_search_path(Opts) ->
     ?LOG_TRACE2("Local search path: ~p", LocalPaths),
     LocalPaths ++ DepPaths ++ OtpPaths.
 
+-spec is_source_file_name(file:filename()) -> boolean().
+is_source_file_name(Name) ->
+    lists:member(filename:extension(Name), [".erl", ".hrl", ".yrl", ".xrl", ".app", ".src", ".beam", ".mk", ".md"]).
+
 -spec has_erl_files(file:filename()) -> boolean().
 has_erl_files(Dir) ->
     case file:list_dir(Dir) of
@@ -90,7 +95,10 @@ find_src_dirs(SrcDir) ->
             ErlSubs = lists:filtermap(
                 fun(Sub) ->
                     D = filename:join(SrcDir, Sub),
-                    case filelib:is_dir(D) andalso has_erl_files(D) of
+                    % entries with a source file extension are files; the
+                    % directories of an OTP tree hold hundreds of them and
+                    % a stat for each costs more than the whole scan
+                    case not is_source_file_name(Sub) andalso filelib:is_dir(D) andalso has_erl_files(D) of
                         true -> {true, D};
                         false -> false
                     end
@@ -210,6 +218,11 @@ index_file_name(Opts) ->
     D = etylizer_dir(Opts),
     filename:join(D, "index").
 
+-spec symtab_cache_file_name(cmd_opts()) -> file:filename().
+symtab_cache_file_name(Opts) ->
+    D = etylizer_dir(Opts),
+    filename:join(D, "symtab_cache").
+
 -spec rebar_lock_file(cmd_opts()) -> file:filename().
 rebar_lock_file(Opts) ->
     RootDir = root_dir(Opts),
@@ -223,35 +236,54 @@ rebar_config_from_lock_file(F) ->
 
 -spec find_module_path(search_path(), atom()) -> search_path_entry().
 find_module_path(SearchPath, Module) ->
-    case ets:whereis(?TABLE) of
-        undefined -> ets:new(?TABLE, [set, named_table, {keypos, 1}]);
-        _ -> ok
+    % The table holds, per module, the position of its entry in the search
+    % path, and is reset when a different search path comes along. Neither the
+    % search path nor an entry goes into ETS: both carry the include
+    % directories of the whole tree, which ETS copies on every insert and
+    % lookup.
+    case {ets:whereis(?TABLE), erlang:get(paths_search_path)} of
+        {Tid, SearchPath} when Tid =/= undefined -> ok;
+        {undefined, _} ->
+            ets:new(?TABLE, [set, named_table, {keypos, 1}]),
+            erlang:put(paths_search_path, SearchPath);
+        _ ->
+            ets:delete_all_objects(?TABLE),
+            erlang:put(paths_search_path, SearchPath)
     end,
-    Key = {SearchPath, Module},
-    case ets:lookup(?TABLE, Key) of
-        [{_, Result}] -> ?assert_type(Result, search_path_entry());
+    case ets:lookup(?TABLE, Module) of
+        [{_, Index}] -> entry_for_module(SearchPath, ?assert_type(Index, pos_integer()), Module);
         [] ->
-            X = really_find_module_path(SearchPath, Module),
-            true = ets:insert(?TABLE, {Key, X}),
-            X;
+            Index = really_find_module_path(SearchPath, Module),
+            true = ets:insert(?TABLE, {Module, Index}),
+            entry_for_module(SearchPath, Index, Module);
         Y -> ?ABORT("Unexpected entry in mod_table: ~p", Y)
     end.
 
--spec really_find_module_path(search_path(), atom()) -> search_path_entry().
+-spec entry_for_module(search_path(), pos_integer(), atom()) -> search_path_entry().
+entry_for_module(SearchPath, Index, Module) ->
+    {Kind, SrcPath, Includes} = lists:nth(Index, SearchPath),
+    File = utils:normalize_path(filename:join(SrcPath, module_file_name(Module))),
+    {Kind, File, Includes}.
+
+-spec module_file_name(atom()) -> string().
+module_file_name(Module) -> string:concat(atom_to_list(Module), ".erl").
+
+% The position in the search path of the first entry whose directory holds
+% the module's source.
+-spec really_find_module_path(search_path(), atom()) -> pos_integer().
 really_find_module_path(SearchPath, Module) ->
-    Filename = string:concat(atom_to_list(Module), ".erl"),
-    SearchResult = lists:search(
-      fun({_, SrcPath, _Includes}) ->
-            case filelib:find_file(Filename, SrcPath) of
-                {ok, _} -> true;
-                {error, not_found} -> false
-            end
-      end, SearchPath),
-    case SearchResult of
-        {value, {Kind, SrcPath, Includes}} ->
-            File = utils:normalize_path(filename:join(SrcPath, Filename)),
-            ?LOG_DEBUG("Resolved module ~p to file ~p", Module, File),
-            {Kind, File, Includes};
+    Filename = module_file_name(Module),
+    % one stat per search path entry; filelib:find_file/2 would also run its
+    % wildcard machinery on every entry, which for the modules of a standard
+    % symtab adds up to tens of milliseconds
+    Found = lists:search(
+      fun({_, {_, SrcPath, _Includes}}) ->
+            filelib:is_regular(filename:join(SrcPath, Filename))
+      end, lists:enumerate(SearchPath)),
+    case Found of
+        {value, {Index, {_, SrcPath, _}}} ->
+            ?LOG_DEBUG("Resolved module ~p to file ~p", Module, filename:join(SrcPath, Filename)),
+            Index;
         false ->
             Dirs = lists:map(fun({_, P, _}) -> P end, SearchPath),
             ?LOG_WARN("Module ~p not found, search path: ~s",

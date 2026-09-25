@@ -239,6 +239,7 @@ doWork(Opts) ->
           _ -> metrics:init()
       end,
       parse_cache:init(Opts),
+      symtab_cache:init(Opts),
       stdtypes:init(),
       try
           fix_load_path(Opts),
@@ -285,6 +286,7 @@ doWork(Opts) ->
               Path -> metrics:dump(Path)
           end,
           metrics:cleanup(),
+          symtab_cache:cleanup(),
           parse_cache:cleanup(),
           stdtypes:cleanup()
       end

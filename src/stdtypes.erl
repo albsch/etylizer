@@ -412,7 +412,8 @@ builtin_funs() ->
     case ets:lookup(?TABLE, Key) of
         [{_, {StoredHash, Result}}] when Hash =:= StoredHash -> ?assert_type(Result, fun_types());
         [] ->
-            X = mk_builtin_funs(Path),
+            % once per VM from here, once per machine through symtab_cache
+            X = symtab_cache:cached(Path, builtin_funs, fun() -> mk_builtin_funs(Path) end),
             true = ets:insert(?TABLE, {Key, {Hash, X}}),
             X;
         Y -> ?ABORT("Unexpected entry in stdtypes_table: ~p", Y)
