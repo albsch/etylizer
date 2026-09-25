@@ -227,7 +227,36 @@ trivial(S, T) -> trivial_plain(S, T).
 -spec trivial_plain(ast:ty(), ast:ty()) -> boolean().
 trivial_plain(S, T) ->
     members(union, S) -- members(union, T) =:= []
-        orelse members(intersection, T) -- members(intersection, S) =:= [].
+        orelse members(intersection, T) -- members(intersection, S) =:= []
+        orelse syn_leq(S, T).
+
+% Subtyping decided by the syntax alone, a sound under-approximation: false
+% means "not decided here", never "false". It settles what a case over an AST
+% type leaves behind, ty() /\ not(P1 | .. | Pk) /\ {type, _, _, _} <:
+% {any(), any(), any(), any()}, where the semantic check would have to expand
+% the negated union; the tuple member alone is below the right side.
+-spec syn_leq(ast:ty(), ast:ty()) -> boolean().
+syn_leq(S, S) -> true;
+syn_leq(_, {predef, any}) -> true;
+syn_leq({predef, none}, _) -> true;
+syn_leq({intersection, Ss}, T) -> lists:any(fun(S) -> syn_leq(S, T) end, Ss);
+syn_leq({union, Ss}, T) -> lists:all(fun(S) -> syn_leq(S, T) end, Ss);
+syn_leq(S, {intersection, Ts}) -> lists:all(fun(T) -> syn_leq(S, T) end, Ts);
+syn_leq(S, {union, Ts}) -> lists:any(fun(T) -> syn_leq(S, T) end, Ts);
+syn_leq({tuple, Ss}, {tuple, Ts}) when length(Ss) =:= length(Ts) ->
+    lists:all(fun({A, B}) -> syn_leq(A, B) end, lists:zip(Ss, Ts));
+syn_leq({tuple, _}, {tuple_any}) -> true;
+syn_leq({list, A}, {list, B}) -> syn_leq(A, B);
+syn_leq({nonempty_list, A}, {list, B}) -> syn_leq(A, B);
+syn_leq({nonempty_list, A}, {nonempty_list, B}) -> syn_leq(A, B);
+syn_leq({empty_list}, {list, _}) -> true;
+syn_leq({cons, H, R}, {list, B}) -> syn_leq(H, B) andalso syn_leq(R, {list, B});
+syn_leq({cons, H, R}, {nonempty_list, B}) -> syn_leq(H, B) andalso syn_leq(R, {list, B});
+syn_leq({cons, H1, R1}, {cons, H2, R2}) -> syn_leq(H1, H2) andalso syn_leq(R1, R2);
+syn_leq({singleton, A}, {predef, atom}) when is_atom(A) -> true;
+syn_leq({singleton, I}, {predef, integer}) when is_integer(I) -> true;
+syn_leq({map, _}, {map_any}) -> true;
+syn_leq(_, _) -> false.
 
 -spec members(union | intersection, ast:ty()) -> [ast:ty()].
 members(K, {K, Tys}) -> Tys;

@@ -277,11 +277,15 @@ clean_cons_valid_test() ->
     % holds for every a, and a is nested at both polarities, so the peel cannot
     % remove it -- the semantic check can
     [] = Clean([{ttuple([A, Int]), ttuple([A, IntAtom])}], []),
-    % ground, or over fixed variables only: left to tally
-    G = {ttuple([Int]), ttuple([IntAtom])},
+    % ground, or over fixed variables only: left to tally when the syntax does
+    % not decide them (a range below integer() needs the semantics)
+    G = {ttuple([{range, 1, 5}]), ttuple([Int])},
     [G] = Clean([G], []),
-    F = {ttuple([A, Int]), ttuple([A, IntAtom])},
+    F = {ttuple([A, {range, 1, 5}]), ttuple([A, Int])},
     [F] = Clean([F], ['a']),
+    % but a constraint true by its syntax alone is dropped, ground or not
+    [] = Clean([{ttuple([Int]), ttuple([IntAtom])}], []),
+    [] = Clean([{ttuple([A, Int]), ttuple([A, IntAtom])}], ['a']),
     ok.
 
 %% A variable whose lower bounds mention it is an accumulator; nested only
