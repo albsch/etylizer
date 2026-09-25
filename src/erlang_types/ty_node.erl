@@ -174,7 +174,9 @@ is_empty(TyNode) ->
       % T0 = os:system_time(microsecond),
       {Result, LocalCache} = is_empty(TyNode, #{}),
       % io:format(user,"Empty ~p in ~p us~n", [TyNode, os:system_time(microsecond)-T0]),
-      utils:update_ets_from_map(?CACHE, LocalCache),
+      % the phi memo of dnf_ty_tuple lives only for this call
+      Descriptors = maps:filter(fun({phi_tuple_memo, _, _}, _) -> false; (_, _) -> true end, LocalCache),
+      utils:update_ets_from_map(?CACHE, Descriptors),
       ets:insert(?CACHE, [{TyNode, Result}]),
       Result
   end.

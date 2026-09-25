@@ -37,6 +37,28 @@ is_empty_line({Pos, Neg, T}, ST) ->
 
 -spec phi([ty:type()], [?ATOM:type()], S) -> {boolean(), S} when S :: is_empty_cache().
 phi(BigS, [], ST) ->
+  phi_impl(BigS, [], ST);
+phi(BigS, NegList, ST) ->
+  % phi_solve/4 reaches the same (BigS, NegList) pair from many branches. A
+  % negated tuple whose components are disjoint from BigS at all but two
+  % positions leaves two live branches, and the branch that subtracts a disjoint
+  % atom from a component gives the component back unchanged: with k such tuples
+  % the tree has 2^k leaves over a few thousand distinct sub-problems. Memoize
+  % on the pair in the threaded emptiness cache, as phi_norm/4 does in the
+  % normalize cache. The entries follow the cache's rollback discipline: when
+  % ty_node:is_empty/2 discards what it computed under an emptiness assumption
+  % that turned out false, they go with it. ty_node:is_empty/1 keeps them out
+  % of the ETS table.
+  Key = {phi_tuple_memo, BigS, NegList},
+  case ST of
+    #{Key := Cached} -> {Cached, ST};
+    _ ->
+      {Res, ST1} = phi_impl(BigS, NegList, ST),
+      {Res, ST1#{Key => Res}}
+  end.
+
+-spec phi_impl([ty:type()], [?ATOM:type()], S) -> {boolean(), S} when S :: is_empty_cache().
+phi_impl(BigS, [], ST) ->
   ?METRIC_SUBPROBLEM(subty, tuple),
   % TODO how big of a performance hit is non-shortcut behavior of the true branch?
   lists:foldl(
@@ -45,7 +67,7 @@ phi(BigS, [], ST) ->
     end, 
     {false, ST}, 
   BigS);
-phi(BigS, [Ty | N], ST) ->
+phi_impl(BigS, [Ty | N], ST) ->
   ?METRIC_SUBPROBLEM(subty, tuple),
   maybe
     {false, ST1} ?= lists:foldl(fun(_S, {true, ST0}) -> {true, ST0}; (S, {false, ST0}) -> ?NODE:is_empty(S, ST0) end, {false, ST}, BigS),
