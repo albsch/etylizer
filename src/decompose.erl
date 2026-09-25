@@ -27,6 +27,7 @@
 % argument has to be non-empty.
 %
 %     S <: {T1, .., Tn}     ==  pi_1(S) <: T1, .., pi_n(S) <: Tn  for a ground S made of n-tuples
+%     S <: [H @ R]          ==  pi_hd(S) <: H, pi_tl(S) <: R      for a ground S made of cons cells
 %
 % The projection rule is where a pattern binds its variables. `case E of {tag, X, Y}
 % -> ..` constrains the scrutinee's type against `{$tag, $X, $Y}`, and the left side
@@ -76,7 +77,7 @@ rule(C = {S, T}, LBs, SymTab) ->
         {{intersection, Ss}, {tuple, Ts}} ->
             case tuple_meet(Ss, length(Ts)) of
                 {ok, Ms} -> if_nonempty(Ms, lists:zip(Ms, Ts), C, LBs, SymTab);
-                none -> projected(C, Ts, SymTab)
+                none -> projected(C, {tuple, length(Ts)}, Ts, SymTab)
             end;
         {{fun_full, Ps, R}, {fun_full, As, B}} when length(Ps) =:= length(As) ->
             if_nonempty(As, lists:zip(As, Ps) ++ [{R, B}], C, LBs, SymTab);
@@ -88,22 +89,34 @@ rule(C = {S, T}, LBs, SymTab) ->
         {{cons, H, R}, {list, B}} -> if_nonempty([H, R], [{H, B}, {R, {list, B}}], C, LBs, SymTab);
         {{cons, H, R}, {nonempty_list, B}} -> if_nonempty([H, R], [{H, B}, {R, {list, B}}], C, LBs, SymTab);
         {{cons, H1, R1}, {cons, H2, R2}} -> if_nonempty([H1, R1], [{H1, H2}, {R1, R2}], C, LBs, SymTab);
-        {_, {tuple, Ts}} -> projected(C, Ts, SymTab);
+        {_, {tuple, Ts}} -> projected(C, {tuple, length(Ts)}, Ts, SymTab);
+        {_, {cons, H, R}} -> projected(C, cons, [H, R], SymTab);
         _ -> [C]
     end.
 
 % The projection rule; only worth trying when the right side has variables to bound.
--spec projected({ast:ty(), ast:ty()}, [ast:ty()], symtab:t()) -> constraints().
-projected(C = {S, _}, Ts, SymTab) ->
+% shape: {tuple, N} for n-tuples, cons for cons cells (head and tail)
+-type shape() :: {tuple, pos_integer()} | cons.
+
+-spec projected({ast:ty(), ast:ty()}, shape(), [ast:ty()], symtab:t()) -> constraints().
+projected(C = {S, _}, Shape, Ts, SymTab) ->
     case lists:any(fun(Ti) -> not sets:is_empty(tyutils:free_in_ty(Ti)) end, Ts)
          andalso sets:is_empty(tyutils:free_in_ty(S)) of
         true ->
-            case project(S, length(Ts), SymTab) of
+            case project(S, Shape, SymTab) of
                 {ok, Pis} -> lists:zip(Pis, Ts);
                 none -> [C]
             end;
         false -> [C]
     end.
+
+-spec arity(shape()) -> pos_integer().
+arity({tuple, N}) -> N;
+arity(cons) -> 2.
+
+-spec any_of(shape()) -> ast:ty().
+any_of({tuple, N}) -> {tuple, lists:duplicate(N, {predef, any})};
+any_of(cons) -> {cons, {predef, any}, {predef, any}}.
 
 -spec if_nonempty([ast:ty()], constraints(), {ast:ty(), ast:ty()}, lower_bounds(), symtab:t()) -> constraints().
 if_nonempty(Conditions, Decomposed, Original, LBs, SymTab) ->
@@ -203,122 +216,144 @@ memo(SymTab, Key, Compute) ->
 % negations of tuple patterns. A member contained in a negated pattern vanishes,
 % one disjoint from it stays, a partial overlap gives up. Empty members are
 % dropped, which is what makes the result exact.
--spec project(ast:ty(), pos_integer(), symtab:t()) -> {ok, [ast:ty()]} | none.
-project(S, N, SymTab) ->
-    memo(SymTab, {project, S, N}, fun() ->
-        case members(S, N, SymTab, 4) of
+-spec project(ast:ty(), shape(), symtab:t()) -> {ok, [ast:ty()]} | none.
+project(S, Shape, SymTab) ->
+    memo(SymTab, {project, S, Shape}, fun() ->
+        case members(S, Shape, SymTab, 4) of
             none -> none;
             {ok, Members} ->
                 NonEmpty = [M || M <- Members, lists:all(fun(X) -> nonempty_ground(X, SymTab) end, M)],
                 Cols = lists:foldl(
                     fun(M, Acc) -> [[X | Col] || {X, Col} <- lists:zip(M, Acc)] end,
-                    lists:duplicate(N, []), NonEmpty),
+                    lists:duplicate(arity(Shape), []), NonEmpty),
                 {ok, [ast_lib:mk_union(lists:usort(Col)) || Col <- Cols]}
         end
     end).
 
 % The n-tuples whose union is S /\ {any()^n}, as component lists. S has to be an
 % intersection with an n-tuple among its members, so that S is made of n-tuples.
--spec members(ast:ty(), pos_integer(), symtab:t(), non_neg_integer()) -> {ok, [[ast:ty()]]} | none.
-members({intersection, Ss}, N, SymTab, D) ->
-    case lists:any(fun({tuple, Cs}) -> length(Cs) =:= N; (_) -> false end, Ss) of
+-spec members(ast:ty(), shape(), symtab:t(), non_neg_integer()) -> {ok, [[ast:ty()]]} | none.
+members({intersection, Ss}, Shape, SymTab, D) ->
+    case lists:any(fun(X) -> literal_of_shape(X, Shape) end, Ss) of
         false -> none;
         true ->
             Pos = [X || X <- Ss, element(1, X) =/= negation],
             Neg = [X || {negation, X} <- Ss],
-            case pos_members(Pos, N, SymTab, D) of
+            case pos_members(Pos, Shape, SymTab, D) of
                 none -> none;
-                {ok, Ms} -> apply_negs(Ms, Neg, N, SymTab)
+                {ok, Ms} -> apply_negs(Ms, Neg, Shape, SymTab)
             end
     end;
 members(_, _, _, _) -> none.
 
+% S has to be made of values of the shape, which a literal member guarantees
+-spec literal_of_shape(ast:ty(), shape()) -> boolean().
+literal_of_shape({tuple, Cs}, {tuple, N}) -> length(Cs) =:= N;
+literal_of_shape({cons, _, _}, cons) -> true;
+literal_of_shape({nonempty_list, _}, cons) -> true;
+literal_of_shape(_, _) -> false.
+
 % the cartesian meet of the positive members' tuples
--spec pos_members([ast:ty()], pos_integer(), symtab:t(), non_neg_integer()) -> {ok, [[ast:ty()]]} | none.
-pos_members(Pos, N, SymTab, D) ->
+-spec pos_members([ast:ty()], shape(), symtab:t(), non_neg_integer()) -> {ok, [[ast:ty()]]} | none.
+pos_members(Pos, Shape, SymTab, D) ->
     lists:foldl(
         fun(_, none) -> none;
            (P, {ok, Acc}) ->
-                case tuple_members(P, N, SymTab, D) of
+                case shape_members(P, Shape, SymTab, D) of
                     none -> none;
                     {ok, Ms} -> {ok, [[ast_lib:mk_intersection([A, B]) || {A, B} <- lists:zip(M1, M2)] || M1 <- Acc, M2 <- Ms]}
                 end
-        end, {ok, [lists:duplicate(N, {predef, any})]}, Pos).
+        end, {ok, [lists:duplicate(arity(Shape), {predef, any})]}, Pos).
 
-% the n-tuples of one positive member; named types are unfolded up to depth D
--spec tuple_members(ast:ty(), pos_integer(), symtab:t(), non_neg_integer()) -> {ok, [[ast:ty()]]} | none.
-tuple_members({tuple, Cs}, N, _, _) when length(Cs) =:= N -> {ok, [Cs]};
-tuple_members({tuple, _}, _, _, _) -> {ok, []};
-tuple_members({tuple_any}, N, _, _) -> {ok, [lists:duplicate(N, {predef, any})]};
-tuple_members({predef, any}, N, _, _) -> {ok, [lists:duplicate(N, {predef, any})]};
-tuple_members({union, Us}, N, SymTab, D) ->
+% the values of the shape in one positive member, as component lists; named
+% types are unfolded up to depth D
+-spec shape_members(ast:ty(), shape(), symtab:t(), non_neg_integer()) -> {ok, [[ast:ty()]]} | none.
+shape_members({tuple, Cs}, {tuple, N}, _, _) when length(Cs) =:= N -> {ok, [Cs]};
+shape_members({tuple, _}, _, _, _) -> {ok, []};
+shape_members({tuple_any}, {tuple, N}, _, _) -> {ok, [lists:duplicate(N, {predef, any})]};
+shape_members({tuple_any}, cons, _, _) -> {ok, []};
+shape_members({cons, H, R}, cons, _, _) -> {ok, [[H, R]]};
+shape_members({nonempty_list, A}, cons, _, _) -> {ok, [[A, {list, A}]]};
+shape_members({list, A}, cons, _, _) -> {ok, [[A, {list, A}]]};   % the [] part holds no cons cell
+shape_members({cons, _, _}, {tuple, _}, _, _) -> {ok, []};
+shape_members({nonempty_list, _}, {tuple, _}, _, _) -> {ok, []};
+shape_members({list, _}, {tuple, _}, _, _) -> {ok, []};
+shape_members({empty_list}, _, _, _) -> {ok, []};
+shape_members({predef, any}, Shape, _, _) -> {ok, [lists:duplicate(arity(Shape), {predef, any})]};
+shape_members({union, Us}, Shape, SymTab, D) ->
     lists:foldl(
         fun(_, none) -> none;
            (U, {ok, Acc}) ->
-                case tuple_members(U, N, SymTab, D) of none -> none; {ok, Ms} -> {ok, Acc ++ Ms} end
+                case shape_members(U, Shape, SymTab, D) of none -> none; {ok, Ms} -> {ok, Acc ++ Ms} end
         end, {ok, []}, Us);
-tuple_members({named, Loc, Ref, Args}, N, SymTab, D) when D > 0 ->
+shape_members({named, Loc, Ref, Args}, Shape, SymTab, D) when D > 0 ->
     try
         {ty_scheme, Vars, Body} = symtab:lookup_ty(Ref, Loc, SymTab),
         Unfolded = subst:apply(subst:from_list(lists:zip([V || {V, _} <- Vars], Args)), Body, no_clean),
-        tuple_members(Unfolded, N, SymTab, D - 1)
+        shape_members(Unfolded, Shape, SymTab, D - 1)
     catch _:_ -> none
     end;
-tuple_members(I = {intersection, _}, N, SymTab, D) -> members(I, N, SymTab, D);
-tuple_members(T, N, SymTab, _) -> ground_tuple_members(T, N, SymTab).
+shape_members(I = {intersection, _}, Shape, SymTab, D) -> members(I, Shape, SymTab, D);
+shape_members(T, Shape, SymTab, _) -> ground_members(T, Shape, SymTab).
 
-% A ground type of any other syntax either misses the n-tuples entirely, or
-% contains all of them, or is left alone.
--spec ground_tuple_members(ast:ty(), pos_integer(), symtab:t()) -> {ok, [[ast:ty()]]} | none.
-ground_tuple_members(T, N, SymTab) ->
+% A ground type of any other syntax either misses the values of the shape
+% A ground type of any other syntax either misses the values of the shape
+% entirely, or contains all of them, or is left alone.
+-spec ground_members(ast:ty(), shape(), symtab:t()) -> {ok, [[ast:ty()]]} | none.
+ground_members(T, Shape, SymTab) ->
     case sets:is_empty(tyutils:free_in_ty(T)) of
         false -> none;
         true ->
-            AnyN = {tuple, lists:duplicate(N, {predef, any})},
-            case subty(SymTab, ast_lib:mk_intersection([T, AnyN]), {predef, none}) of
+            Any = any_of(Shape),
+            case subty(SymTab, ast_lib:mk_intersection([T, Any]), {predef, none}) of
                 true -> {ok, []};
                 false ->
-                    case subty(SymTab, AnyN, T) of
-                        true -> {ok, [lists:duplicate(N, {predef, any})]};
+                    case subty(SymTab, Any, T) of
+                        true -> {ok, [lists:duplicate(arity(Shape), {predef, any})]};
                         false -> none
                     end
             end
     end.
 
 % subtract the negated patterns, member by member
--spec apply_negs([[ast:ty()]], [ast:ty()], pos_integer(), symtab:t()) -> {ok, [[ast:ty()]]} | none.
-apply_negs(Ms, [], _N, _SymTab) -> {ok, Ms};
-apply_negs(Ms, [Neg | Negs], N, SymTab) ->
-    Pats = case neg_patterns(Neg, N) of none -> ground_tuple_members(Neg, N, SymTab); R -> R end,
+-spec apply_negs([[ast:ty()]], [ast:ty()], shape(), symtab:t()) -> {ok, [[ast:ty()]]} | none.
+apply_negs(Ms, [], _Shape, _SymTab) -> {ok, Ms};
+apply_negs(Ms, [Neg | Negs], Shape, SymTab) ->
+    Pats = case neg_patterns(Neg, Shape) of none -> ground_members(Neg, Shape, SymTab); R -> R end,
     case Pats of
         none -> none;
         {ok, Ps} ->
             case subtract_all(Ms, Ps, SymTab) of
                 none -> none;
-                {ok, Ms2} -> apply_negs(Ms2, Negs, N, SymTab)
+                {ok, Ms2} -> apply_negs(Ms2, Negs, Shape, SymTab)
             end
     end.
 
-% the n-tuple patterns inside a negated type; tuples of other arities do not touch n-tuples
--spec neg_patterns(ast:ty(), pos_integer()) -> {ok, [[ast:ty()]]} | none.
-neg_patterns({tuple, Cs}, N) when length(Cs) =:= N -> {ok, [Cs]};
+% the patterns of the shape inside a negated type; values of other shapes do not
+% touch the shape
+-spec neg_patterns(ast:ty(), shape()) -> {ok, [[ast:ty()]]} | none.
+neg_patterns({tuple, Cs}, {tuple, N}) when length(Cs) =:= N -> {ok, [Cs]};
 neg_patterns({tuple, _}, _) -> {ok, []};
-neg_patterns({union, Us}, N) ->
+neg_patterns({cons, H, R}, cons) -> {ok, [[H, R]]};
+neg_patterns({nonempty_list, A}, cons) -> {ok, [[A, {list, A}]]};
+neg_patterns({list, A}, cons) -> {ok, [[A, {list, A}]]};
+neg_patterns({cons, _, _}, _) -> {ok, []};
+neg_patterns({nonempty_list, _}, _) -> {ok, []};
+neg_patterns({list, _}, _) -> {ok, []};
+neg_patterns({union, Us}, Shape) ->
     lists:foldl(fun(_, none) -> none;
-                   (U, {ok, Acc}) -> case neg_patterns(U, N) of none -> none; {ok, Ps} -> {ok, Acc ++ Ps} end
+                   (U, {ok, Acc}) -> case neg_patterns(U, Shape) of none -> none; {ok, Ps} -> {ok, Acc ++ Ps} end
                 end, {ok, []}, Us);
-neg_patterns({intersection, [X]}, N) -> neg_patterns(X, N);
-neg_patterns({intersection, Xs}, N) ->
-    % {..} /\ {any(), ..}: the componentwise meet of the tuples
-    case lists:all(fun({tuple, Cs}) -> length(Cs) =:= N; (_) -> false end, Xs) of
-        true -> {ok, [[ast_lib:mk_intersection(Col) || Col <- transpose([Cs || {tuple, Cs} <- Xs])]]};
+neg_patterns({intersection, [X]}, Shape) -> neg_patterns(X, Shape);
+neg_patterns({intersection, Xs}, Shape) ->
+    % {..} /\ {any(), ..}: the componentwise meet of the members' patterns
+    Rs = [neg_patterns(X, Shape) || X <- Xs],
+    case lists:all(fun({ok, [_]}) -> true; (_) -> false end, Rs) of
+        true -> {ok, [[ast_lib:mk_intersection(Col) || Col <- transpose([P || {ok, [P]} <- Rs])]]};
         false -> none
     end;
 neg_patterns({singleton, _}, _) -> {ok, []};
 neg_patterns({empty_list}, _) -> {ok, []};
-neg_patterns({list, _}, _) -> {ok, []};
-neg_patterns({nonempty_list, _}, _) -> {ok, []};
-neg_patterns({cons, _, _}, _) -> {ok, []};
 neg_patterns({fun_full, _, _}, _) -> {ok, []};
 neg_patterns({range, _, _}, _) -> {ok, []};
 neg_patterns({map_any}, _) -> {ok, []};
@@ -397,6 +432,9 @@ step_test() ->
         StuckMap = [{Map(V, Atom), Map(A, B)}],
         StuckMap = Step(StuckMap),
         [{Int, V}, {V, A}, {Atom, B}] = Step([{Int, V} | StuckMap]),
+        % cons projection: a ground list pattern binds head and tail
+        L3 = {intersection, [{cons, Atom, {cons, Int, {empty_list}}}, {cons, {predef, any}, {predef, any}}]},
+        [{Atom, A}, {{cons, Int, {empty_list}}, B}] = Step([{L3, {cons, A, B}}]),
         % lists and conses
         [{Int, A}] = Step([{{list, Int}, {list, A}}]),
         [{Int, A}, {{empty_list}, {list, A}}] = Step([{{cons, Int, {empty_list}}, {list, A}}]),
