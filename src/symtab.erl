@@ -32,6 +32,7 @@
 -ifdef(TEST). % for tally tests
 -export([
     from_types/1,
+    overlay_id/1,
     extend_add_record/4
 ]).
 -endif.
@@ -157,7 +158,7 @@ empty() -> #tab { funs = #{}, ops = #{}, types = #{}, records = #{}, modules = #
 
 -spec std_symtab(paths:search_path(), t(), feature_flags:gradual_typing_mode()) -> t().
 std_symtab(SearchPath, OverlaySymtab, Gradual) ->
-    CacheKey = {erlang:phash2(OverlaySymtab), Gradual},
+    CacheKey = {overlay_id(OverlaySymtab), Gradual},
     case persistent_term:get(std_symtab_cache, undefined) of
         {CacheKey, CachedTab} ->
             ?LOG_DEBUG("Using cached standard symtab"),
@@ -352,16 +353,31 @@ create_ref_tuple({qref, Module}, Name, Arity) ->
 % the types from these modules, but for simplicity, we add everything.)
 -spec extend_symtab_with_module_list(symtab:t(), paths:search_path(), [atom()], t()) -> symtab:t().
 extend_symtab_with_module_list(Symtab, SearchPath, Modules, OverlaySymtab) ->
-    traverse_module_list(SearchPath, Symtab, Modules, OverlaySymtab).
+    traverse_module_list(SearchPath, Symtab, Modules, OverlaySymtab, overlay_id(OverlaySymtab)).
 
--spec traverse_module_list(paths:search_path(), t(), [ast:mod_name()], t()) -> t().
-traverse_module_list(SearchPath, Symtab, [CurrentModule | RemainingModules], OverlaySymtab) ->
+% Identifies the overlay in the keys of symtab_cache. Neither erlang:phash2
+% nor term_to_binary is stable for large maps across VM instances (their
+% internal order is salted per VM), so the maps are turned into sorted lists
+% before the term is hashed.
+-spec overlay_id(t()) -> string().
+overlay_id(OverlaySymtab) ->
+    binary_to_list(binary:encode_hex(erlang:md5(term_to_binary(canonical(OverlaySymtab))))).
+
+-spec canonical(term()) -> term().
+canonical(M) when is_map(M) -> {'$map', lists:sort([{canonical(K), canonical(V)} || {K, V} <- maps:to_list(M)])};
+canonical(L) when is_list(L) -> [canonical(X) || X <- L];
+canonical(T) when is_tuple(T) -> list_to_tuple([canonical(X) || X <- tuple_to_list(T)]);
+canonical(X) -> X.
+
+-spec traverse_module_list(paths:search_path(), t(), [ast:mod_name()], t(), string()) -> t().
+traverse_module_list(SearchPath, Symtab, [CurrentModule | RemainingModules], OverlaySymtab, OverlayId) ->
     case maps:get(CurrentModule, Symtab#tab.modules, error) of
         error ->
             % It's a new module
-            Entry = {_, Filename, _} = paths:find_module_path(SearchPath, CurrentModule),
-            Forms = retrieve_forms_for_source(Entry),
-            NewSymtab = extend_symtab(Filename, Forms, CurrentModule, Symtab, OverlaySymtab),
+            Entry = paths:find_module_path(SearchPath, CurrentModule),
+            {Contribution, AdditionalModules} =
+                module_contribution(Entry, CurrentModule, Symtab#tab.gradual, OverlaySymtab, OverlayId),
+            NewSymtab = merge_contribution(Symtab, Contribution),
             ?LOG_DEBUG("Extended symtab with entries from ~p", CurrentModule),
             case log:allow(trace) of
                 true ->
@@ -371,13 +387,38 @@ traverse_module_list(SearchPath, Symtab, [CurrentModule | RemainingModules], Ove
                 false ->
                     ok
             end,
-            AdditionalModules = ast_utils:referenced_modules_via_types(Forms),
             ?LOG_DEBUG("Additional modules for ~w: ~200p", CurrentModule, AdditionalModules),
-            traverse_module_list(SearchPath, NewSymtab, RemainingModules ++ AdditionalModules, OverlaySymtab);
-        _ -> traverse_module_list(SearchPath, Symtab, RemainingModules, OverlaySymtab)
+            traverse_module_list(SearchPath, NewSymtab, RemainingModules ++ AdditionalModules,
+                                 OverlaySymtab, OverlayId);
+        _ -> traverse_module_list(SearchPath, Symtab, RemainingModules, OverlaySymtab, OverlayId)
     end;
-traverse_module_list(_, Symtab, [], _) ->
+traverse_module_list(_, Symtab, [], _, _) ->
     Symtab.
+
+% What a module adds to a symtab depends on its source, the overlay and the
+% gradual mode only: extend_symtab_internal puts module-qualified keys and
+% never reads other modules' entries, so extending an empty table and merging
+% the result equals extending the table directly. The contribution is
+% therefore computed once and kept by symtab_cache across runs, together with
+% the modules the source refers to through its types, which the traversal
+% needs to continue without the forms.
+-spec module_contribution(paths:search_path_entry(), ast:mod_name(), feature_flags:gradual_typing_mode(),
+                          t(), string()) -> {t(), [ast:mod_name()]}.
+module_contribution(Entry = {_, Filename, _}, Module, Gradual, OverlaySymtab, OverlayId) ->
+    symtab_cache:cached(Filename, {Module, Gradual, OverlayId}, fun() ->
+        Forms = retrieve_forms_for_source(Entry),
+        Contribution = extend_symtab(Filename, Forms, Module, (empty())#tab{gradual = Gradual}, OverlaySymtab),
+        {Contribution, ast_utils:referenced_modules_via_types(Forms)}
+    end).
+
+-spec merge_contribution(t(), t()) -> t().
+merge_contribution(Tab, Contribution) ->
+    Tab#tab{
+        funs = maps:merge(Tab#tab.funs, Contribution#tab.funs),
+        types = maps:merge(Tab#tab.types, Contribution#tab.types),
+        records = maps:merge(Tab#tab.records, Contribution#tab.records),
+        modules = maps:merge(Tab#tab.modules, Contribution#tab.modules)
+    }.
 
 -spec retrieve_forms_for_source(paths:search_path_entry()) -> ast:forms().
 retrieve_forms_for_source({Kind, Src, Includes}) ->
@@ -387,8 +428,29 @@ retrieve_forms_for_source({Kind, Src, Includes}) ->
     end.
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-include("etylizer_main.hrl").
+
 -spec from_types(any()) -> t().
 from_types(Types) when is_list(Types) -> (empty())#tab{types = maps:from_list(Types)};
 from_types(Types) when is_map(Types) -> (empty())#tab{types = Types}.
+
+% The cache merges a module's contribution to an empty table into the table
+% being built. That must equal extending the table directly.
+contribution_merge_test() ->
+    Opts = #opts{},
+    SearchPath = paths:compute_search_path(Opts),
+    parse_cache:with_cache(Opts, fun() ->
+        Overlay = empty(),
+        Load = fun(Mod, Tab) ->
+                   Entry = {_, File, _} = paths:find_module_path(SearchPath, Mod),
+                   Forms = retrieve_forms_for_source(Entry),
+                   {File, Forms, extend_symtab(File, Forms, Mod, Tab, Overlay)}
+               end,
+        {_, _, Base} = Load(lists, empty()),
+        {File, Forms, Direct} = Load(calendar, Base),
+        Contribution = extend_symtab(File, Forms, calendar, (empty())#tab{gradual = Base#tab.gradual}, Overlay),
+        ?assertEqual(Direct, merge_contribution(Base, Contribution))
+    end).
 -endif.
 
