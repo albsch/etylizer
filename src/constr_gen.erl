@@ -883,8 +883,10 @@ case_clause_unmatched_constraints(Ctx, LowersBefore, Upper, Scrut) ->
 ) -> {ast:ty(), ast:ty(), constr:constrs(), constr:constr_case_branch()}.
 case_clause_constrs(Ctx, TyScrut, Scrut, NeedsUnmatchedCheck, LowersBefore,
     {case_clause, L, Pat, Guards, Exps}, ExpectedTy) ->
+    % a catch-all first clause cannot refine the scrutinee's variables, see case_clause_env/7
+    Refine = not (catch_all(Pat, Guards) andalso LowersBefore =:= []),
     {BodyLower, BodyUpper, BodyEnvCs, BodyEnv} =
-        case_clause_env(Ctx, L, TyScrut, Scrut, Pat, Guards),
+        case_clause_env(Ctx, L, TyScrut, Scrut, Pat, Guards, Refine),
     % skip generating guard env vars to reduce the variable count when guards are empty
     {GuardEnvCs, GuardEnv} =
         case Guards of
@@ -1016,12 +1018,36 @@ catch_clause_pat_env(Ctx, L, ExcType, Pat, Stack) ->
 -spec case_clause_env(ctx(), ast:loc(), ast:ty(), ast:exp(), ast:pat(), [ast:guard()]) ->
           {ast:ty(), ast:ty(), constr:constrs(), constr:constr_env()}.
 case_clause_env(Ctx, L, TyScrut, Scrut, Pat, Guards) ->
+    case_clause_env(Ctx, L, TyScrut, Scrut, Pat, Guards, true).
+
+% Refine = false skips the refinement of the scrutinee's variables by the clause.
+% That refinement turns the scrutinee expression into a pattern and binds every
+% variable in it to a fresh component variable of the clause's type Ti. For a
+% catch-all clause (a variable or a wildcard, no guards) that no earlier clause
+% narrowed, Ti is the scrutinee's own type, so each fresh variable is bounded
+% below by the very component it stands for and the intersection with the
+% variable's type is the identity. The desugaring of `X = {a, B, C}` into
+% `case {a, B, C} of X -> ..` produces exactly this shape, one fresh variable and
+% one tuple constraint per component of the right-hand side, all of it dead
+% weight in tally's input.
+-spec case_clause_env(ctx(), ast:loc(), ast:ty(), ast:exp(), ast:pat(), [ast:guard()], boolean()) ->
+          {ast:ty(), ast:ty(), constr:constrs(), constr:constr_env()}.
+case_clause_env(Ctx, L, TyScrut, Scrut, Pat, Guards, Refine) ->
     {Lower, Upper} = pat_guard_lower_upper(Ctx#ctx.symtab, Pat, Guards, Scrut),
     Ti = ast_lib:mk_intersection([TyScrut, Upper]),
-    {Ci0, Gamma0} = pat_env(Ctx, L, Ti, pat_of_exp(Scrut)),
+    {Ci0, Gamma0} =
+        case Refine of
+            true -> pat_env(Ctx, L, Ti, pat_of_exp(Scrut));
+            false -> {sets:new([{version, 2}]), #{}}
+        end,
     {Ci1, Gamma1} = pat_guard_env(Ctx, L, Ti, Pat, Guards),
     Gamma2 = intersect_envs(Gamma1, Gamma0),
     {Lower, Upper, sets:union(Ci0, Ci1), Gamma2}.
+
+-spec catch_all(ast:pat(), [ast:guard()]) -> boolean().
+catch_all({var, _, _}, []) -> true;
+catch_all({wildcard, _}, []) -> true;
+catch_all(_, _) -> false.
 
 % ⌊ p when g ⌋_e and ⌈ p when g ⌉_e
 -spec pat_guard_lower_upper(symtab:t(), ast:pat(), [ast:guard()], ast:exp()) -> {ast:ty(), ast:ty()}.
