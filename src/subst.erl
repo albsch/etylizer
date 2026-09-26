@@ -19,7 +19,8 @@
     mk_tally_subst/2,
     base_subst/1,
     collect_vars/5,
-    clean_cons/3
+    clean_cons/3,
+    peel_cons/3
 ]).
 
 -ifdef(TEST).
@@ -57,19 +58,209 @@ clean_cons(CList, Fixed, SymTab) ->
     %% {named, _, Ref, Args} as a leaf, walking only Args with the correct
     %% polarity per parameter
     VCache = compute_variance_cache(SymTab),
-    VarPositions = collect_vars_clist(CList, 0, #{}, Fixed, VCache),
+    Peeled = peel(drop_trivial(CList), Fixed, VCache),
+    case drop_valid(Peeled, Fixed, SymTab) of
+        Peeled -> Peeled;
+        Fewer -> clean_cons(Fewer, Fixed, SymTab)
+    end.
 
-    Apply = fun(Ty) -> maps:fold(
-        fun(VariableName, VariablePositions, Tyy) ->
-            case lists:usort(VariablePositions) of
-                [0] -> apply_base(#{VariableName => {predef, none}}, Tyy);
-                [1] -> apply_base(#{VariableName => {predef, any}}, Tyy);
-                _ -> Tyy
+% The peel and the syntactic drop alone, for constraints that decompose:step/3
+% has already taken apart. The semantic drop runs once, in clean_cons, on the
+% constraints as generated: on substituted constraints its subtype checks meet
+% the large AST types, and what a decomposition leaves behind is trivial
+% syntactically anyway.
+-spec peel_cons([{ast:ty(), ast:ty()}], sets:set(ast:ty_varname()), symtab:t()) -> [{ast:ty(), ast:ty()}].
+peel_cons(CList, Fixed, SymTab) ->
+    peel(drop_trivial(CList), Fixed, compute_variance_cache(SymTab)).
+
+% Eliminate a non-fixed variable whose occurrences all pull in the same
+% direction. A constraint in which the variable *is* one side gives it a bound:
+% `S <: V` a lower bound S, `V <: T` an upper bound T. Every other occurrence is
+% nested, and collect_vars reports with which polarity. If the nested
+% occurrences are all covariant, the smallest admissible value is the best one
+% everywhere, so
+%
+%     V := union(lower bounds of V)
+%
+% preserves satisfiability: the lower bounds then hold trivially, the upper
+% bounds by transitivity (union(Lowers) <: A <: T for any solution A), and every
+% nested covariant occurrence only got smaller. Dually, all-contravariant nested
+% occurrences allow V := intersection(upper bounds of V). A variable that is
+% never nested may take either side; the one with fewer bounds leaves fewer and
+% smaller constraints behind. A variable nested at both polarities has no best
+% value and is left alone. With no bounds at all this is the clean it replaces:
+% a variable used only covariantly becomes none(), one used only
+% contravariantly any().
+%
+% The substitution of a round is simultaneous, so a body may not name a
+% variable substituted in the same round, itself included; a variable that has
+% to wait is picked up by a later round. Every round removes its variables from
+% the constraints for good, so the rounds terminate.
+-spec peel([{ast:ty(), ast:ty()}], sets:set(ast:ty_varname()), variance_cache()) ->
+    [{ast:ty(), ast:ty()}].
+peel(CList, Fixed, VCache) ->
+    {Bounds, Nested} = lists:foldl(
+        fun({S, T}, Acc) -> side(T, S, 1, side(S, T, 0, Acc, Fixed, VCache), Fixed, VCache) end,
+        {#{}, #{}}, CList),
+    % highest name first: any fixed order does, and this one is deterministic
+    Vars = lists:reverse(lists:usort([V || {V, _} <- maps:keys(Bounds)] ++ maps:keys(Nested))),
+    Bodies = [{V, B, vars(B)} || V <- Vars, B <- [recursive_body(V, body(V, Bounds, Nested), Nested)], B =/= keep],
+    {Subst, _} = lists:foldl(
+        fun({V, B, Named}, Acc = {S, Taken}) ->
+            case lists:member(V, Named ++ Taken) orelse lists:any(fun(W) -> maps:is_key(W, S) end, Named) of
+                true -> Acc;
+                false -> {S#{V => B}, Named ++ Taken}
             end
-        end, Ty, VarPositions)
-            end,
+        end, {#{}, []}, Bodies),
+    case map_size(Subst) of
+        0 -> CList;
+        _ -> peel(drop_trivial([{apply_base(Subst, S), apply_base(Subst, T)} || {S, T} <- CList]),
+                  Fixed, VCache)
+    end.
 
-    [{Apply(C1), Apply(C2)} || {C1, C2} <- CList].
+% One side of a constraint, CPos 0 for the left and 1 for the right side. A bare
+% non-fixed variable is a bound and not an occurrence: the other side bounds it,
+% from above in `V <: T` and from below in `S <: V`. Every other side contributes
+% the polarities of the variables nested in it, which is what collect_vars walks.
+-spec side(ast:ty(), ast:ty(), 0 | 1, Acc, sets:set(ast:ty_varname()), variance_cache()) -> Acc
+    when Acc :: {#{{ast:ty_varname(), 0 | 1} => [ast:ty()]}, #{ast:ty_varname() => [0 | 1]}}.
+side({var, V}, Other, CPos, Acc = {B, N}, Fixed, _VCache) ->
+    case sets:is_element(V, Fixed) of
+        true -> Acc;
+        false -> {maps:update_with({V, CPos}, fun(L) -> [Other | L] end, [Other], B), N}
+    end;
+side(Ty, _Other, CPos, {B, N}, Fixed, VCache) ->
+    {B, collect_vars(Ty, CPos, N, Fixed, VCache)}.
+
+-spec body(ast:ty_varname(), #{{ast:ty_varname(), 0 | 1} => [ast:ty()]},
+           #{ast:ty_varname() => [0 | 1]}) -> ast:ty() | keep.
+body(V, Bounds, Nested) ->
+    Uppers = maps:get({V, 0}, Bounds, []),
+    Lowers = maps:get({V, 1}, Bounds, []),
+    case maps:get(V, Nested, []) of
+        [0] -> ast_lib:mk_union(lists:usort(Lowers));
+        [1] -> ast_lib:mk_intersection(lists:usort(Uppers));
+        [] when length(Uppers) =< length(Lowers) -> ast_lib:mk_intersection(lists:usort(Uppers));
+        [] -> ast_lib:mk_union(lists:usort(Lowers));
+        _ -> keep
+    end.
+
+% A body that names its own variable is the shape of an accumulator: the lower
+% bounds of the result of a fold are the initial value and the results of the
+% folded function, which are built from the accumulator itself. If every nested
+% occurrence of V is covariant and every self-reference sits under a type
+% constructor, the least solution of  body(V) <: V  is the least fixpoint
+% mu X. body(X): the map V -> body(V) is monotone, so every solution A has
+% body(A) <: A and hence mu <: A (Knaster-Tarski), and every other constraint is
+% monotone in V or an upper bound of V, so it keeps holding for mu. Like the
+% peel of a non-recursive covariant variable, this takes the smallest admissible
+% value and is exact for satisfiability. The guard makes the mu type contractive.
+-spec recursive_body(ast:ty_varname(), ast:ty() | keep, #{ast:ty_varname() => [0 | 1]}) -> ast:ty() | keep.
+recursive_body(_V, keep, _Nested) -> keep;
+recursive_body(V, B, Nested) ->
+    case lists:member(V, vars(B)) of
+        false -> B;
+        true ->
+            case maps:get(V, Nested, []) =:= [0] andalso guarded(V, B, false) of
+                true ->
+                    X = {mu_var, list_to_atom("$mu_" ++ atom_to_list(V))},
+                    {mu, X, apply_base(#{V => X}, B)};
+                false -> keep
+            end
+    end.
+
+% every occurrence of V in T is below a tuple, cons, list, fun or map constructor
+-spec guarded(ast:ty_varname(), ast:ty(), boolean()) -> boolean().
+guarded(V, {var, V}, Guarded) -> Guarded;
+guarded(_, {var, _}, _) -> true;
+guarded(V, {union, Ts}, G) -> lists:all(fun(T) -> guarded(V, T, G) end, Ts);
+guarded(V, {intersection, Ts}, G) -> lists:all(fun(T) -> guarded(V, T, G) end, Ts);
+guarded(V, {negation, T}, G) -> guarded(V, T, G);
+guarded(V, {tuple, Ts}, _) -> lists:all(fun(T) -> guarded(V, T, true) end, Ts);
+guarded(V, {cons, A, B}, _) -> guarded(V, A, true) andalso guarded(V, B, true);
+guarded(V, {list, A}, _) -> guarded(V, A, true);
+guarded(V, {nonempty_list, A}, _) -> guarded(V, A, true);
+guarded(V, {improper_list, A, B}, _) -> guarded(V, A, true) andalso guarded(V, B, true);
+guarded(V, {nonempty_improper_list, A, B}, _) -> guarded(V, A, true) andalso guarded(V, B, true);
+guarded(V, {fun_full, As, R}, _) -> lists:all(fun(T) -> guarded(V, T, true) end, [R | As]);
+guarded(V, {fun_any_arg, R}, _) -> guarded(V, R, true);
+guarded(V, {map, Assocs}, _) -> lists:all(fun({_, K, Val}) -> guarded(V, K, true) andalso guarded(V, Val, true) end, Assocs);
+guarded(V, {mu, _, T}, G) -> guarded(V, T, G);
+guarded(V, T, _) -> not lists:member(V, vars(T)).
+
+-spec vars(term()) -> [ast:ty_varname()].
+vars(T) -> utils:everything(fun({var, V}) when is_atom(V) -> {ok, V}; (_) -> error end, T).
+
+% none() <: T, S <: any(), and S <: T where every member of S (read as a union)
+% is a member of T, or every member of T (read as an intersection) is a member
+% of S, hold under every assignment. They are what a peeled bound leaves behind:
+% S <: V becomes S <: S once V is peeled to S, V <: T becomes none() <: T once V
+% is peeled to none(), and with several lower bounds L_i <: V becomes
+% L_i <: L_1 | .. | L_n. Dropping them keeps their variables out of tally's input.
+%
+% A constraint that names a variable tally may instantiate is also dropped when
+% it holds under every assignment semantically: subty treats variables as
+% opaque, so subty:is_subty(S, T) is exactly that. Such a constraint still ties
+% its variables into one partition and can hold a variable at both polarities,
+% which keeps the peel from eliminating it. Ground constraints are left to
+% tally: each is its own partition anyway, and deciding them here is where the
+% time would go.
+-spec drop_trivial([{ast:ty(), ast:ty()}]) -> [{ast:ty(), ast:ty()}].
+drop_trivial(CList) -> [C || C = {S, T} <- CList, not trivial(S, T)].
+
+-spec drop_valid([{ast:ty(), ast:ty()}], sets:set(ast:ty_varname()), symtab:t()) ->
+    [{ast:ty(), ast:ty()}].
+drop_valid(CList, Fixed, SymTab) ->
+    [C || C = {S, T} <- CList,
+          not (lists:any(fun(V) -> not sets:is_element(V, Fixed) end, vars(C))
+               andalso subty:is_subty(SymTab, S, T))].
+
+-spec trivial(ast:ty(), ast:ty()) -> boolean().
+trivial({predef, none}, _) -> true;
+trivial(_, {predef, any}) -> true;
+trivial(S, T = {mu, X, Body}) ->
+    % what a recursive peel leaves behind: L_i <: mu X. (L_1 | .. | L_n)[X]
+    Unfolded = utils:everywhere(fun(Y) when Y =:= X -> {ok, T}; (_) -> error end, Body),
+    members(union, S) -- members(union, Unfolded) =:= [] orelse trivial_plain(S, T);
+trivial(S, T) -> trivial_plain(S, T).
+
+-spec trivial_plain(ast:ty(), ast:ty()) -> boolean().
+trivial_plain(S, T) ->
+    members(union, S) -- members(union, T) =:= []
+        orelse members(intersection, T) -- members(intersection, S) =:= []
+        orelse syn_leq(S, T).
+
+% Subtyping decided by the syntax alone, a sound under-approximation: false
+% means "not decided here", never "false". It settles what a case over an AST
+% type leaves behind, ty() /\ not(P1 | .. | Pk) /\ {type, _, _, _} <:
+% {any(), any(), any(), any()}, where the semantic check would have to expand
+% the negated union; the tuple member alone is below the right side.
+-spec syn_leq(ast:ty(), ast:ty()) -> boolean().
+syn_leq(S, S) -> true;
+syn_leq(_, {predef, any}) -> true;
+syn_leq({predef, none}, _) -> true;
+syn_leq({intersection, Ss}, T) -> lists:any(fun(S) -> syn_leq(S, T) end, Ss);
+syn_leq({union, Ss}, T) -> lists:all(fun(S) -> syn_leq(S, T) end, Ss);
+syn_leq(S, {intersection, Ts}) -> lists:all(fun(T) -> syn_leq(S, T) end, Ts);
+syn_leq(S, {union, Ts}) -> lists:any(fun(T) -> syn_leq(S, T) end, Ts);
+syn_leq({tuple, Ss}, {tuple, Ts}) when length(Ss) =:= length(Ts) ->
+    lists:all(fun({A, B}) -> syn_leq(A, B) end, lists:zip(Ss, Ts));
+syn_leq({tuple, _}, {tuple_any}) -> true;
+syn_leq({list, A}, {list, B}) -> syn_leq(A, B);
+syn_leq({nonempty_list, A}, {list, B}) -> syn_leq(A, B);
+syn_leq({nonempty_list, A}, {nonempty_list, B}) -> syn_leq(A, B);
+syn_leq({empty_list}, {list, _}) -> true;
+syn_leq({cons, H, R}, {list, B}) -> syn_leq(H, B) andalso syn_leq(R, {list, B});
+syn_leq({cons, H, R}, {nonempty_list, B}) -> syn_leq(H, B) andalso syn_leq(R, {list, B});
+syn_leq({cons, H1, R1}, {cons, H2, R2}) -> syn_leq(H1, H2) andalso syn_leq(R1, R2);
+syn_leq({singleton, A}, {predef, atom}) when is_atom(A) -> true;
+syn_leq({singleton, I}, {predef, integer}) when is_integer(I) -> true;
+syn_leq({map, _}, {map_any}) -> true;
+syn_leq(_, _) -> false.
+
+-spec members(union | intersection, ast:ty()) -> [ast:ty()].
+members(K, {K, Tys}) -> Tys;
+members(_, Ty) -> [Ty].
 
 -type clean_mode() :: {clean, symtab:t()} | no_clean.
 
@@ -93,11 +284,12 @@ apply(S, T, _) -> apply_base(S, T).
 apply_base(S, T) ->
     case T of
         {singleton, _} -> T;
-        % TODO full bitstring support
         {bitstring} -> T;
-        % {binary, _, _} -> T;
+        {bitstring, _, _} -> T;
         {empty_list} -> T;
+        {empty_bitstring} -> T;
         {cons, A, B} -> {cons, apply_base(S, A), apply_base(S, B)};
+        {bitstring_cons, A, B} -> {bitstring_cons, apply_base(S, A), apply_base(S, B)};
         {list, U} -> {list, apply_base(S, U)};
         {mu, V, U} -> {mu, V, apply_base(S, U)};
         {nonempty_list, U} -> {nonempty_list, apply_base(S, U)};
@@ -173,9 +365,6 @@ clean_type(Ty, Fix, SymTab) ->
     Cleaned.
 
 
-combine_vars(_K, V1, V2) ->
-    lists:uniq(V1 ++ V2).
-
 %% Variance precomputation
 %%
 %% For every schema {ty_scheme, [V1..Vn], Body} stored in the symtab, we
@@ -197,13 +386,23 @@ combine_vars(_K, V1, V2) ->
 -type variance_cache() :: #{ symtab_ty_key() => [variance()] }.
 -type symtab_ty_key() :: {ty_key, atom(), atom(), arity()}.
 
+%% The cache depends on the types of the symtab only. clean_cons computes it once
+%% per tally invocation, with a symtab that is extended per function by a fun env
+%% but keeps its types map, so remember the last result per process, keyed on
+%% that map. Matching the key against the same term is a pointer comparison.
 -spec compute_variance_cache(symtab:t()) -> variance_cache().
 compute_variance_cache(SymTab) ->
     Types = symtab:get_types(SymTab),
-    Initial = maps:map(
-        fun(_, {ty_scheme, Vars, _}) -> [unused || _ <- Vars] end,
-        Types),
-    variance_fixpoint(Initial, Types).
+    case erlang:get(subst_variance_cache) of
+        {Types, Cache} -> Cache;
+        _ ->
+            Initial = maps:map(
+                fun(_, {ty_scheme, Vars, _}) -> [unused || _ <- Vars] end,
+                Types),
+            Cache = variance_fixpoint(Initial, Types),
+            erlang:put(subst_variance_cache, {Types, Cache}),
+            Cache
+    end.
 
 -spec variance_fixpoint(variance_cache(), map()) -> variance_cache().
 variance_fixpoint(OldCache, Types) ->
@@ -282,28 +481,18 @@ merge_pol(X, unused) -> X;
 merge_pol(X, X) -> X;
 merge_pol(_, _) -> inv.
 
-% Walks a list of subtype constraints; for each {C1, C2}, C1 is in covariant
-% (CPos) and C2 in contravariant (1-CPos) position. 
-collect_vars_clist(L, CPos, Pos, Fix, VCache) when is_list(L) ->
-    lists:foldl(fun({C1, C2}, Acc) ->
-        M1 = collect_vars(C1, CPos, Acc, Fix, VCache),
-        M2 = collect_vars(C2, 1-CPos, Acc, Fix, VCache),
-        maps:merge_with(fun combine_vars/3, M1, M2)
-                end, Pos, L).
-
 -spec collect_vars(ast:ty() | {ty_hole}, 0 | 1, #{ast:ty_varname() => [0 | 1]},
                    sets:set(ast:ty_varname()), variance_cache()) ->
     #{ast:ty_varname() => [0 | 1]}.
 collect_vars(M = {map, _}, CPos, Pos, Fix, VCache) ->
     collect_vars(ty_parser:rewrite_map_to_representation(M), CPos, Pos, Fix, VCache);
 collect_vars({K, Components}, CPos, Pos, Fix, VCache) when K == union; K == intersection; K == tuple ->
-    VPos = lists:map(fun(Ty) -> collect_vars(Ty, CPos, Pos, Fix, VCache) end, Components),
-    lists:foldl(fun(FPos, Current) -> maps:merge_with(fun combine_vars/3, FPos, Current) end, Pos, VPos);
+    lists:foldl(fun(Ty, P) -> collect_vars(Ty, CPos, P, Fix, VCache) end, Pos, Components);
 collect_vars({fun_full, Components, Target}, CPos, Pos, Fix, VCache) ->
-    VPos = lists:map(fun(Ty) -> collect_vars(Ty, 1 - CPos, Pos, Fix, VCache) end, Components),
-    M1 = lists:foldl(fun(FPos, Current) -> maps:merge_with(fun combine_vars/3, FPos, Current) end, Pos, VPos),
-    M2 = collect_vars(Target, CPos, Pos, Fix, VCache),
-    maps:merge_with(fun combine_vars/3, M1, M2);
+    P1 = lists:foldl(fun(Ty, P) -> collect_vars(Ty, 1 - CPos, P, Fix, VCache) end, Pos, Components),
+    collect_vars(Target, CPos, P1, Fix, VCache);
+collect_vars({fun_any_arg, Target}, CPos, Pos, Fix, VCache) ->
+    collect_vars(Target, CPos, Pos, Fix, VCache);
 collect_vars({negation, Ty}, CPos, Pos, Fix, VCache) -> collect_vars(Ty, 1 - CPos, Pos, Fix, VCache);
 collect_vars({predef, _}, _CPos, Pos, _, _) -> Pos;
 collect_vars({predef_alias, _}, _CPos, Pos, _, _) -> Pos;
@@ -311,16 +500,16 @@ collect_vars({singleton, _}, _CPos, Pos, _, _) -> Pos;
 collect_vars({range, _, _}, _CPos, Pos, _, _) -> Pos;
 collect_vars({_, any}, _CPos, Pos, _, _) -> Pos;
 collect_vars({empty_list}, _CPos, Pos, _, _) -> Pos;
+collect_vars({empty_bitstring}, _CPos, Pos, _, _) -> Pos;
 collect_vars({bitstring}, _CPos, Pos, _, _) -> Pos;
+collect_vars({bitstring, _, _}, _CPos, Pos, _, _) -> Pos;
 collect_vars({map_any}, _CPos, Pos, _, _) -> Pos;
 collect_vars({tuple_any}, _CPos, Pos, _, _) -> Pos;
 collect_vars({fun_simple}, _CPos, Pos, _, _) -> Pos;
 collect_vars({mu_var, _Name}, _CPos, Pos, _, _) -> Pos;
 collect_vars({ty_hole}, _CPos, Pos, _, _) -> Pos;
 collect_vars({nonempty_improper_list, A, B}, CPos, Pos, Fix, VCache) ->
-    M1 = collect_vars(A, CPos, Pos, Fix, VCache),
-    M2 = collect_vars(B, CPos, Pos, Fix, VCache),
-    maps:merge_with(fun combine_vars/3, M1, M2);
+    collect_vars(B, CPos, collect_vars(A, CPos, Pos, Fix, VCache), Fix, VCache);
 collect_vars({nonempty_list, A}, CPos, Pos, Fix, VCache) ->
     collect_vars(A, CPos, Pos, Fix, VCache);
 collect_vars({list, A}, CPos, Pos, Fix, VCache) ->
@@ -328,21 +517,24 @@ collect_vars({list, A}, CPos, Pos, Fix, VCache) ->
 collect_vars({mu, _MuVar, A}, CPos, Pos, Fix, VCache) -> % skip recursion variables
     collect_vars(A, CPos, Pos, Fix, VCache);
 collect_vars({cons, A, B}, CPos, Pos, Fix, VCache) ->
-    M1 = collect_vars(A, CPos, Pos, Fix, VCache),
-    M2 = collect_vars(B, CPos, Pos, Fix, VCache),
-    maps:merge_with(fun combine_vars/3, M1, M2);
+    collect_vars(B, CPos, collect_vars(A, CPos, Pos, Fix, VCache), Fix, VCache);
+collect_vars({bitstring_cons, A, B}, CPos, Pos, Fix, VCache) ->
+    collect_vars(B, CPos, collect_vars(A, CPos, Pos, Fix, VCache), Fix, VCache);
 collect_vars({improper_list, A, B}, CPos, Pos, Fix, VCache) ->
-    M1 = collect_vars(A, CPos, Pos, Fix, VCache),
-    M2 = collect_vars(B, CPos, Pos, Fix, VCache),
-    maps:merge_with(fun combine_vars/3, M1, M2);
+    collect_vars(B, CPos, collect_vars(A, CPos, Pos, Fix, VCache), Fix, VCache);
 collect_vars({var, Name}, CPos, Pos, Fix, _VCache) ->
-    Z = case sets:is_element(Name, Fix) of
+    case sets:is_element(Name, Fix) of
         true -> Pos;
         _ ->
-            AllPositions = maps:get(Name, Pos, []),
-            Pos#{Name => lists:uniq(AllPositions ++ [CPos])}
-    end,
-    Z;
+            % a variable has at most the two positions 0 and 1, so the list
+            % stays short enough to update by pattern match
+            case Pos of
+                #{Name := [CPos]} -> Pos;
+                #{Name := [_, _]} -> Pos;
+                #{Name := [_Other]} -> Pos#{Name := [0, 1]};
+                _ -> Pos#{Name => [CPos]}
+            end
+    end;
 collect_vars({named, _Loc, Ref, Args}, CPos, Pos, Fix, VCache) ->
     % Use precomputed per-parameter variance to walk each Arg with the right polarity. 
     Variances = lookup_variances(Ref, VCache),
@@ -443,6 +635,13 @@ variance_list_test() ->
     Body = {union, [{empty_list}, {cons, {var, 'T'}, nref('list', [{var, 'T'}])}]},
     Cache = run_variance_fp([{'list', ['T'], Body}]),
     ?assertEqual([co], get_v('list', 1, Cache)).
+
+collect_vars_fun_any_arg_test() ->
+    %% fun((...) -> T) has no argument types to walk, only the return type,
+    %% which sits at the polarity of the fun itself.
+    Ty = {fun_any_arg, {var, 'T'}},
+    ?assertEqual(#{'T' => [0]}, collect_vars(Ty, 0, #{}, sets:new(), #{})),
+    ?assertEqual(#{'T' => [1]}, collect_vars(Ty, 1, #{}, sets:new(), #{})).
 
 -endif.
 

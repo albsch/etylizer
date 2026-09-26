@@ -174,7 +174,9 @@ is_empty(TyNode) ->
       % T0 = os:system_time(microsecond),
       {Result, LocalCache} = is_empty(TyNode, #{}),
       % io:format(user,"Empty ~p in ~p us~n", [TyNode, os:system_time(microsecond)-T0]),
-      utils:update_ets_from_map(?CACHE, LocalCache),
+      % the phi memo of dnf_ty_tuple lives only for this call
+      Descriptors = maps:filter(fun({phi_tuple_memo, _, _}, _) -> false; (_, _) -> true end, LocalCache),
+      utils:update_ets_from_map(?CACHE, Descriptors),
       ets:insert(?CACHE, [{TyNode, Result}]),
       Result
   end.
@@ -311,14 +313,17 @@ normalize(TyNode, FixedVariables) ->
 -spec normalize(type(), monomorphic_variables(), ST) -> 
     {set_of_constraint_sets(), ST} when ST :: normalize_cache().
 normalize(TyNode, FixedVariables, Cache) ->
-  Ty = load(TyNode),
-
+  % Key on TyNode rather than on the loaded descriptor. The two are in bijection
+  % (descriptors are consed through the unique table), but TyNode is a small
+  % {node, Id} term, so hashing the key is O(1) instead of O(size of the BDD),
+  % and a cache hit no longer has to load the descriptor at all.
   case Cache of
-    #{{Ty, FixedVariables} := Res} -> 
+    #{{TyNode, FixedVariables} := Res} ->
       {Res, Cache};
-    _ -> 
+    _ ->
+      Ty = load(TyNode), 
       % assume type is normalized and add to local cache
-      {Result, LC_0} = dnf_ty_variable:normalize(Ty, FixedVariables, Cache#{{Ty, FixedVariables} => [[]]}),
+      {Result, LC_0} = dnf_ty_variable:normalize(Ty, FixedVariables, Cache#{{TyNode, FixedVariables} => [[]]}),
 
       case Result of 
         % satisfiable; 
@@ -335,7 +340,7 @@ normalize(TyNode, FixedVariables, Cache) ->
         % as the result could still be satisfiable
         % only [] is surely unsatisfiable
         Normalized -> 
-          {Normalized, Cache#{{Ty, FixedVariables} => Normalized}}
+          {Normalized, Cache#{{TyNode, FixedVariables} => Normalized}}
       end
   end.
 

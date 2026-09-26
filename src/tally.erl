@@ -69,7 +69,8 @@ is_satisfiable(SymTab, Constraints, FixedVars) ->
     ty_parser:set_symtab(SymTab),
 
     Ctx = gradual_utils:new_ctx(),
-    {InlinedConstrs, _SubtyConstrs, _Maters, _UnificationSubst} = gradual_utils:preprocess_constrs(Constraints, Ctx),
+    {InlinedConstrs0, _SubtyConstrs, _Maters, _UnificationSubst} = gradual_utils:preprocess_constrs(Constraints, Ctx),
+    InlinedConstrs = resolve_overloads(SymTab, InlinedConstrs0),
 
     % Deterministic sort: primary by erts_debug:size, secondary by full term so
     % size ties don't leak the sets:to_list order into
@@ -82,7 +83,7 @@ is_satisfiable(SymTab, Constraints, FixedVars) ->
                  || C = {scsubty, _, S, T} <- sets:to_list(InlinedConstrs)])],
 
     % cleaning is OK, we only care about one solution
-    FinalCons = subst:clean_cons(InternalRawConstraints, FixedVars, SymTab),
+    FinalCons = clean(InternalRawConstraints, FixedVars, SymTab),
 
     MonomorphicTallyVariables = maps:from_list([{ty_variable:new_with_name(Var), []} || Var <- sets:to_list(FixedVars)]),
     ?METRIC(poly_vars, var_metrics(FixedVars, FinalCons, SymTab)),
@@ -103,6 +104,30 @@ is_satisfiable(SymTab, Constraints, FixedVars) ->
                         end, FirstRes, Rest)
     end.
 
+% The peel of subst:clean_cons removes a variable once it has a bare bound, but
+% a bound hidden inside a tuple, a list or an arrow is invisible to it, and the
+% variable then looks nested at both polarities. decompose:step takes such
+% constraints apart, exactly; the peel removes the variables that exposes,
+% which makes further constraints decomposable, until a round changes nothing.
+% Overload resolution runs again in every round, because a peel can turn an
+% argument type concrete. Termination: a round either removes a variable for
+% good or replaces a constraint by constraints on its components.
+-spec clean([{ast:ty(), ast:ty()}], monomorphic_variables(), symtab:t()) -> [{ast:ty(), ast:ty()}].
+clean(Cons, FixedVars, SymTab) ->
+    rounds(subst:clean_cons(Cons, FixedVars, SymTab), FixedVars, SymTab).
+
+-spec rounds([{ast:ty(), ast:ty()}], monomorphic_variables(), symtab:t()) -> [{ast:ty(), ast:ty()}].
+rounds(Cons, FixedVars, SymTab) ->
+    Resolved = lists:flatmap(
+        fun({S, T}) ->
+            [{S2, T2} || {scsubty, _, S2, T2} <- resolve_overload(SymTab, {scsubty, ast:loc_auto(), S, T})]
+        end, Cons),
+    Decomposed = decompose:step(Resolved, FixedVars, SymTab),
+    case lists:usort(Decomposed) =:= lists:usort(Cons) of
+        true -> Cons;
+        false -> rounds(subst:peel_cons(Decomposed, FixedVars, SymTab), FixedVars, SymTab)
+    end.
+
 -spec do_satisfiable([{ast:ty(), ast:ty()}], map()) ->
     {false, [{error, string()}]} | {true, term()}.
 do_satisfiable(FinalCons, MonomorphicTallyVariables) ->
@@ -114,6 +139,118 @@ do_satisfiable(FinalCons, MonomorphicTallyVariables) ->
         false -> {false, []};
         true -> {true, satisfiable}
     end.
+
+% Overload resolution before tally. For a constraint F <= (A1,...,An) -> B where F is an
+% intersection of arrows, a clause whose parameters are disjoint from the argument
+% types A1,...,An cannot apply. If exactly one clause (P1,...,Pn) -> R remains, the
+% constraint is replaced by A1 <= P1, ..., An <= Pn and R <= B. This spares tally the
+% normalization of the intersection of arrows, which is exponential in the clauses.
+% Type variables overlap with everything, so they can only prevent the replacement.
+-spec resolve_overloads(symtab:t(), constr:subty_constrs()) -> constr:subty_constrs().
+resolve_overloads(SymTab, Constrs) ->
+    sets:from_list(lists:flatmap(fun(C) -> resolve_overload(SymTab, C) end, sets:to_list(Constrs))).
+
+
+-spec resolve_overload(symtab:t(), constr:simp_constr_subty()) -> [constr:simp_constr_subty()].
+resolve_overload(SymTab, C = {scsubty, Loc, {intersection, FunTys}, {fun_full, ArgTys, ResTy}}) ->
+    IsClause = fun({fun_full, ParamTys, _}) -> length(ParamTys) =:= length(ArgTys); (_) -> false end,
+    case lists:all(IsClause, FunTys) of
+        false -> [C];
+        true ->
+            case [F || F = {fun_full, ParamTys, _} <- FunTys, overlaps(SymTab, ArgTys, ParamTys)] of
+                [{fun_full, ParamTys, ClauseResTy}] ->
+                    [{scsubty, Loc, ClauseResTy, ResTy} |
+                     [{scsubty, Loc, A, P} || {A, P} <- lists:zip(ArgTys, ParamTys)]];
+                Overlapping ->
+                    case top_of_chain(SymTab, Overlapping, ArgTys) of
+                        {ok, Top} -> [{scsubty, Loc, Top, {fun_full, ArgTys, ResTy}}];
+                        none -> [C]
+                    end
+            end
+    end;
+resolve_overload(_SymTab, C) -> [C].
+
+% A refinement chain of clauses, P1 -> R1 with P1 <: P2 and R1 <: R2 and so on
+% (lists:usort: (nonempty_list(T)) -> nonempty_list(T); (list(T)) -> list(T)),
+% applied to an argument that surely holds a value outside every clause but the
+% last (here []): the intersection then applies exactly like its last clause. A value of the argument at level i gets the result R_i, and R_i <: R_n,
+% so once level n is hit, R_n <: B is required and implies the others, while
+% A <: P_n is required anyway. Type variables of the spec are opaque in the chain
+% test; the smallest instance of the argument is compared against the largest
+% instance of P_{n-1}, so the witness exists under every assignment.
+-spec top_of_chain(symtab:t(), [ast:ty()], [ast:ty()]) -> {ok, ast:ty()} | none.
+top_of_chain(_SymTab, Clauses, _ArgTys) when length(Clauses) < 2 -> none; % nothing to drop
+top_of_chain(SymTab, Clauses, ArgTys) ->
+    % the witness has to exist for every instance of the argument: look for it
+    % in the smallest one (variables at covariant positions none(), at
+    % contravariant positions any()), which is below every instance
+    case smallest_instance({tuple, ArgTys}, 0) of
+        none -> none;
+        {ok, Smallest} ->
+            Refines = fun({fun_full, P1, R1}, {fun_full, P2, R2}) ->
+                subty:is_subty(SymTab, {tuple, P1}, {tuple, P2}) andalso subty:is_subty(SymTab, R1, R2)
+            end,
+            Chain = lists:all(fun({F1, F2}) -> Refines(F1, F2) end,
+                              lists:zip(lists:droplast(Clauses), tl(Clauses))),
+            case Chain of
+                false -> none;
+                true ->
+                    Top = {fun_full, _, _} = lists:last(Clauses),
+                    {fun_full, PBelow, _} = lists:last(lists:droplast(Clauses)),
+                    Largest = utils:everywhere(fun({var, V}) when is_atom(V) -> {ok, {predef, any}}; (_) -> error end,
+                                               {tuple, PBelow}),
+                    Outside = ast_lib:mk_intersection([Smallest, ast_lib:mk_negation(Largest)]),
+                    case subty:is_subty(SymTab, Outside, {predef, none}) of
+                        true -> none;       % the argument might stay inside the refinements
+                        false -> {ok, Top}
+                    end
+            end
+    end.
+
+% The smallest instance of a type over all assignments of its variables:
+% none() at covariant, any() at contravariant positions. A named type with
+% variables among its arguments has unknown variance and gives none.
+-spec smallest_instance(ast:ty(), 0 | 1) -> {ok, ast:ty()} | none.
+smallest_instance({var, V}, 0) when is_atom(V) -> {ok, {predef, none}};
+smallest_instance({var, V}, 1) when is_atom(V) -> {ok, {predef, any}};
+smallest_instance({tuple, Ts}, P) -> smallest_list(Ts, P, fun(L) -> {tuple, L} end);
+smallest_instance({union, Ts}, P) -> smallest_list(Ts, P, fun(L) -> {union, L} end);
+smallest_instance({intersection, Ts}, P) -> smallest_list(Ts, P, fun(L) -> {intersection, L} end);
+smallest_instance({list, A}, P) -> smallest_list([A], P, fun([X]) -> {list, X} end);
+smallest_instance({nonempty_list, A}, P) -> smallest_list([A], P, fun([X]) -> {nonempty_list, X} end);
+smallest_instance({cons, H, R}, P) -> smallest_list([H, R], P, fun([X, Y]) -> {cons, X, Y} end);
+smallest_instance({negation, T}, P) ->
+    case smallest_instance(T, 1 - P) of {ok, X} -> {ok, {negation, X}}; none -> none end;
+smallest_instance({fun_full, As, R}, P) ->
+    case {smallest_list(As, 1 - P, fun(L) -> L end), smallest_instance(R, P)} of
+        {{ok, As2}, {ok, R2}} -> {ok, {fun_full, As2, R2}};
+        _ -> none
+    end;
+smallest_instance({map, Assocs}, P) ->
+    Rs = [{K, smallest_instance(KT, P), smallest_instance(VT, P)} || {K, KT, VT} <- Assocs],
+    case lists:all(fun({_, {ok, _}, {ok, _}}) -> true; (_) -> false end, Rs) of
+        true -> {ok, {map, [{K, KT, VT} || {K, {ok, KT}, {ok, VT}} <- Rs]}};
+        false -> none
+    end;
+smallest_instance(T, _) ->
+    case sets:is_empty(tyutils:free_in_ty(T)) of true -> {ok, T}; false -> none end.
+
+-spec smallest_list([ast:ty()], 0 | 1, fun(([ast:ty()]) -> ast:ty() | [ast:ty()])) -> {ok, ast:ty() | [ast:ty()]} | none.
+smallest_list(Ts, P, Build) ->
+    Rs = [smallest_instance(T, P) || T <- Ts],
+    case lists:all(fun({ok, _}) -> true; (none) -> false end, Rs) of
+        true -> {ok, Build([X || {ok, X} <- Rs])};
+        false -> none
+    end.
+
+-spec overlaps(symtab:t(), [ast:ty()], [ast:ty()]) -> boolean().
+overlaps(SymTab, ArgTys, ParamTys) ->
+    lists:all(
+        fun({{var, _}, _}) -> true; % nothing known about this argument
+           ({ArgTy, ParamTy}) ->
+                not subty:is_subty(SymTab, ast_lib:mk_intersection([ArgTy, ParamTy]), stdtypes:tnone())
+        end,
+        lists:zip(ArgTys, ParamTys)).
 
 -spec tally(symtab:t(), constr:collected_constrs()) -> tally_res().
 tally(SymTab, Constraints) -> tally(SymTab, Constraints, sets:new()).
@@ -127,7 +264,8 @@ tally(SymTab, Constraints, FixedVars) ->
     ty_parser:set_symtab(SymTab),
 
     Ctx = gradual_utils:new_ctx(),
-    {InlinedConstrs, SubtyConstrs, Maters, UnificationSubst} = gradual_utils:preprocess_constrs(Constraints, Ctx),
+    {InlinedConstrs0, SubtyConstrs, Maters, UnificationSubst} = gradual_utils:preprocess_constrs(Constraints, Ctx),
+    InlinedConstrs = resolve_overloads(SymTab, InlinedConstrs0),
 
     InternalRawConstraints =
     lists:map( fun ({scsubty, _, S, T}) -> {S, T} end,
@@ -231,6 +369,26 @@ uf_union(A, B, Parent) ->
     end.
 
 -ifdef(TEST).
+
+chain_test() ->
+    global_state:with_new_state(fun() ->
+        T = tvar('T'), B = tvar('B'),
+        Usort = {intersection, [{fun_full, [{nonempty_list, T}], {nonempty_list, T}},
+                                {fun_full, [{list, T}], {list, T}}]},
+        Ground = {list, stdtypes:tatom()},
+        % list(atom()) holds [], which no nonempty_list(T) does: the last clause applies
+        [{scsubty, _, {fun_full, [{list, T}], {list, T}}, {fun_full, [Ground], B}}] =
+            resolve_overload(symtab:empty(), {scsubty, ast:loc_auto(), Usort, {fun_full, [Ground], B}}),
+        % a non-empty list may sit inside the first clause for some T: untouched
+        C2 = {scsubty, ast:loc_auto(), Usort, {fun_full, [{nonempty_list, stdtypes:tatom()}], B}},
+        [C2] = resolve_overload(symtab:empty(), C2),
+        % list(B) holds [] for every B: resolved as well
+        [{scsubty, _, {fun_full, [{list, T}], {list, T}}, _}] =
+            resolve_overload(symtab:empty(), {scsubty, ast:loc_auto(), Usort, {fun_full, [{list, B}], B}}),
+        % nonempty_list(B) may be empty (B = none()): no witness, untouched
+        C4 = {scsubty, ast:loc_auto(), Usort, {fun_full, [{nonempty_list, B}], B}},
+        [C4] = resolve_overload(symtab:empty(), C4)
+    end).
 
 partition_test() ->
     A = tvar('A'), B = tvar('B'),

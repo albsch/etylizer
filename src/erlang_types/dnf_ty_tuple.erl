@@ -10,9 +10,9 @@
   normalize_line/3,
   all_variables_line/4,
   phi/3,
-  phi_solve/4,
+  phi_solve/5,
   phi_norm/4,
-  phi_norm_solve/5,
+  phi_norm_solve/6,
   unparse_any/1,
   unparse_any/0
 ]).
@@ -36,6 +36,28 @@ is_empty_line({Pos, Neg, T}, ST) ->
 
 -spec phi([ty:type()], [?ATOM:type()], S) -> {boolean(), S} when S :: is_empty_cache().
 phi(BigS, [], ST) ->
+  phi_impl(BigS, [], ST);
+phi(BigS, NegList, ST) ->
+  % phi_solve/4 reaches the same (BigS, NegList) pair from many branches. A
+  % negated tuple whose components are disjoint from BigS at all but two
+  % positions leaves two live branches, and the branch that subtracts a disjoint
+  % atom from a component gives the component back unchanged: with k such tuples
+  % the tree has 2^k leaves over a few thousand distinct sub-problems. Memoize
+  % on the pair in the threaded emptiness cache, as phi_norm/4 does in the
+  % normalize cache. The entries follow the cache's rollback discipline: when
+  % ty_node:is_empty/2 discards what it computed under an emptiness assumption
+  % that turned out false, they go with it. ty_node:is_empty/1 keeps them out
+  % of the ETS table.
+  Key = {phi_tuple_memo, BigS, NegList},
+  case ST of
+    #{Key := Cached} -> {Cached, ST};
+    _ ->
+      {Res, ST1} = phi_impl(BigS, NegList, ST),
+      {Res, ST1#{Key => Res}}
+  end.
+
+-spec phi_impl([ty:type()], [?ATOM:type()], S) -> {boolean(), S} when S :: is_empty_cache().
+phi_impl(BigS, [], ST) ->
   % TODO how big of a performance hit is non-shortcut behavior of the true branch?
   lists:foldl(
     fun(_, {true, ST0}) -> {true, ST0};
@@ -43,27 +65,22 @@ phi(BigS, [], ST) ->
     end, 
     {false, ST}, 
   BigS);
-phi(BigS, [Ty | N], ST) ->
+phi_impl(BigS, [Ty | N], ST) ->
   maybe
     {false, ST1} ?= lists:foldl(fun(_S, {true, ST0}) -> {true, ST0}; (S, {false, ST0}) -> ?NODE:is_empty(S, ST0) end, {false, ST}, BigS),
-    lists:foldl(
-      fun(E, Acc) -> phi_solve(E, Acc, N, BigS) end,
-      {true, ST1},
-      lists:zip(lists:seq(1, length(ty_tuple:components(Ty))), lists:zip(BigS, ty_tuple:components(Ty))))
+    phi_fold_components(BigS, ty_tuple:components(Ty), 1, {true, ST1}, N)
   end.
 
--spec phi_solve({integer(), {ty:type(), ty:type()}}, {boolean(), S}, [?ATOM:type()], [ty:type()]) -> {boolean(), S} when S :: is_empty_cache().
-phi_solve(_, {false, ST2}, _, _) -> {false, ST2};
-phi_solve({Index, {_PComponent, NComponent}}, {true, ST2}, N, BigS) ->
+-spec phi_fold_components([ty:type()], [ty:type()], integer(), {boolean(), S}, [?ATOM:type()]) -> {boolean(), S} when S :: is_empty_cache().
+phi_fold_components(_BigS, [], _Idx, Acc, _N) -> Acc;
+phi_fold_components(BigS, [NComp | Rest], Idx, Acc, N) ->
+    phi_fold_components(BigS, Rest, Idx + 1, phi_solve(Idx, NComp, Acc, N, BigS), N).
+
+-spec phi_solve(integer(), ty:type(), {boolean(), S}, [?ATOM:type()], [ty:type()]) -> {boolean(), S} when S :: is_empty_cache().
+phi_solve(_, _, {false, ST2}, _, _) -> {false, ST2};
+phi_solve(Index, NComponent, {true, ST2}, N, BigS) ->
     % remove pi_Index(NegativeComponents) from pi_Index(PComponents) and continue searching
-    DoDiff = fun({IIndex, PComp}) ->
-      case IIndex of
-        Index -> ?NODE:difference(PComp, NComponent);
-        _ -> PComp
-      end
-             end,
-    NewBigS = lists:map(DoDiff, lists:zip(lists:seq(1, length(BigS)), BigS)),
-    phi(NewBigS, N, ST2).
+    phi(replace_at(Index, BigS, NComponent), N, ST2).
 
 
 -spec normalize_line({[T], [T], ?LEAF:type()}, monomorphic_variables(), S) -> 
@@ -78,9 +95,24 @@ normalize_line({Pos, Neg, T}, Fixed, ST) ->
   BigS = ty_tuple:big_intersect(Pos),
   phi_norm(ty_tuple:components(BigS), Neg, Fixed, ST).
 
--spec phi_norm([ty_node:type()], [T], monomorphic_variables(), S) -> 
+-spec phi_norm([ty_node:type()], [T], monomorphic_variables(), S) ->
     {set_of_constraint_sets(), S} when S :: normalize_cache(), T :: ?ATOM:type().
-phi_norm(BigS, [], Fixed, ST) ->
+phi_norm(BigS, NegList, Fixed, ST) ->
+  % The recursion in phi_norm_solve/5 reaches the same (BigS, NegList) pair over
+  % and over within a single normalize run, so memoize on it. Fixed does not
+  % vary during a traversal, and the memo rides in the threaded cache map, which
+  % is discarded when normalize returns -- it never outlives the call.
+  Key = {phi_norm_tuple_memo, BigS, NegList},
+  case ST of
+    #{Key := Cached} -> {Cached, ST};
+    _ ->
+      {Res, ST1} = phi_norm_impl(BigS, NegList, Fixed, ST),
+      {Res, ST1#{Key => Res}}
+  end.
+
+-spec phi_norm_impl([ty_node:type()], [T], monomorphic_variables(), S) ->
+    {set_of_constraint_sets(), S} when S :: normalize_cache(), T :: ?ATOM:type().
+phi_norm_impl(BigS, [], Fixed, ST) ->
   lists:foldl( % FIXME shortcut
     fun(S, {Res, ST0}) -> 
       {R, ST1} = ty_node:normalize(S, Fixed, ST0),
@@ -88,37 +120,45 @@ phi_norm(BigS, [], Fixed, ST) ->
     end, 
     {[], ST}, 
     BigS);
-phi_norm(BigS, [Ty | N], Fixed, ST) ->
+phi_norm_impl(BigS, [Ty | N], Fixed, ST) ->
   {R1, ST0} = lists:foldl(
-    fun(S, {R2, ST2}) ->
-      {R3, ST3} = ty_node:normalize(S, Fixed, ST2),
-      {constraint_set:join(R2, R3, Fixed), ST3}
+    fun(_S, {[[]], ST2}) -> {[[]], ST2};
+       (S, {R2, ST2}) ->
+         {R3, ST3} = ty_node:normalize(S, Fixed, ST2),
+         {constraint_set:join(R2, R3, Fixed), ST3}
     end,
     {[], ST},
     BigS),
 
-  {R4, ST4} = lists:foldl(
-    fun(E, Acc) -> phi_norm_solve(E, Acc, N, BigS, Fixed) end,
-    {[[]], ST0},
-    lists:zip(lists:seq(1, length(ty_tuple:components(Ty))), lists:zip(BigS, ty_tuple:components(Ty)))
-  ),
+  case R1 of
+    [[]] -> {[[]], ST0};
+    _ ->
+      {R4, ST4} = phi_norm_fold_components(BigS, ty_tuple:components(Ty), 1,
+                                           {[[]], ST0}, N, Fixed),
+      {constraint_set:join(R1, R4, Fixed), ST4}
+  end.
 
-  {constraint_set:join(R1, R4, Fixed), ST4}.
-
--spec phi_norm_solve({integer(), {ty_node:type(), ty_node:type()}}, {set_of_constraint_sets(), S}, [?ATOM:type()], [ty_node:type()], monomorphic_variables()) ->
+-spec phi_norm_fold_components([ty_node:type()], [ty_node:type()], integer(), {set_of_constraint_sets(), S}, [?ATOM:type()], monomorphic_variables()) ->
     {set_of_constraint_sets(), S} when S :: normalize_cache().
-phi_norm_solve({Index, {_PComponent, NComponent}}, {Result, ST00}, N, BigS, Fixed) ->
-    % remove pi_Index(NegativeComponents) from pi_Index(PComponents) and continue searching
-    DoDiff =
-      fun({IIndex, PComp}) ->
-        case IIndex of
-          Index -> ty_node:difference(PComp, NComponent);
-          _ -> PComp
-        end
-      end,
-    NewBigS = lists:map(DoDiff, lists:zip(lists:seq(1, length(BigS)), BigS)),
-    {Res01, ST01} = phi_norm(NewBigS, N, Fixed, ST00),
+phi_norm_fold_components(_BigS, [], _Idx, Acc, _N, _Fixed) -> Acc;
+phi_norm_fold_components(_BigS, _Comps, _Idx, Acc = {[], _ST}, _N, _Fixed) -> Acc;
+phi_norm_fold_components(BigS, [NComp | Rest], Idx, Acc, N, Fixed) ->
+    phi_norm_fold_components(BigS, Rest, Idx + 1,
+                             phi_norm_solve(Idx, NComp, Acc, N, BigS, Fixed), N, Fixed).
+
+-spec phi_norm_solve(integer(), ty_node:type(), {set_of_constraint_sets(), S}, [?ATOM:type()], [ty_node:type()], monomorphic_variables()) ->
+    {set_of_constraint_sets(), S} when S :: normalize_cache().
+phi_norm_solve(Index, NComponent, {Result, ST00}, N, BigS, Fixed) ->
+    % remove pi_Index(NegativeComponents) from pi_Index(PComponents) and continue
+    % searching; replace_at/3 walks to Index in one pass, where this used to zip
+    % BigS with lists:seq/2 and map a fun comparing the index per component
+    {Res01, ST01} = phi_norm(replace_at(Index, BigS, NComponent), N, Fixed, ST00),
     {constraint_set:meet(Result, Res01, Fixed), ST01}.
+
+-spec replace_at(integer(), [ty_node:type()], ty_node:type()) -> [ty_node:type()].
+replace_at(_, [], _NComp) -> [];
+replace_at(N, [H | T], NComp) when N =< 1 -> [ty_node:difference(H, NComp) | T];
+replace_at(N, [H | T], NComp) -> [H | replace_at(N - 1, T, NComp)].
 
 -spec all_variables_line([T], [T], ?LEAF:type(), all_variables_cache()) -> 
     sets:set(variable()) when T :: ?ATOM:type().
