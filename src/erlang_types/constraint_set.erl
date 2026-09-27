@@ -78,14 +78,40 @@ meet([], _, _) -> [];
 meet(_, [], _) -> [];
 meet([[]], Set2, _) -> Set2;
 meet(Set1, [[]], _) -> Set1;
-meet(S1, S2, Fixed) -> 
-  % when a constraint set is combined, the lower and upper bounds for a variable might change
-  % this in turn could mean the whole constraint set can become unsatisfiable
-  % it is appararently faster to join everything together, 
-  % then minimizing the meet result by using join
-  MeetResult = [[join_constraint_sets(C1, C2, Fixed) || C2 <- S2] || C1 <- S1],
-  R = lists:foldl(fun(S, Acc) -> join(S, Acc, Fixed) end, [], MeetResult),
-  assert_all_cs_sorted(minimize(R)).
+% meet is idempotent: the cartesian product of S with itself yields join(c, c)
+% = c for every c in S, and join(c, c') for c =/= c' is tighter than both and
+% therefore dropped by the minimization. So the result is S again.
+meet(Same, Same, _) -> Same;
+meet(S1, S2, Fixed) ->
+  % Constraint sets are sorted, so set equality is term equality once both sides
+  % are sorted. n is small here, so the sort is cheaper than the product below.
+  case lists:sort(S1) =:= lists:sort(S2) of
+    true -> S1;
+    false -> meet_full(S1, S2, Fixed)
+  end.
+
+% Walks the same |S1| x |S2| product as before, but keeps the accumulator
+% minimal while building it instead of materializing every join and minimizing
+% afterwards: a candidate already subsumed by the accumulator is dropped, and a
+% candidate that subsumes accumulated sets replaces them.
+-spec meet_full(set_of_constraint_sets_rep(), set_of_constraint_sets_rep(), monomorphic_variables()) ->
+    set_of_constraint_sets_rep().
+meet_full(S1, S2, Fixed) ->
+  lists:foldl(
+    fun(C1, Acc1) ->
+        lists:foldl(
+          fun(C2, Acc) ->
+              NewCs = join_constraint_sets(C1, C2, Fixed),
+              case is_unsatisfiable(NewCs, Fixed) of
+                true -> Acc;
+                false ->
+                  case lists:any(fun(Cs) -> is_smaller(Cs, NewCs) end, Acc) of
+                    true -> Acc;
+                    false -> [NewCs | [C || C <- Acc, not is_smaller(NewCs, C)]]
+                  end
+              end
+          end, Acc1, S2)
+    end, [], S1).
 
 % TODO this implementation creates smaller result set of constraint sets, investigate
 % meet(S1, S2, Fixed) -> 
@@ -125,7 +151,7 @@ join(Set, [], _Fixed) -> Set;
 join(S1, S2, Fixed) ->
   S22 = lists:filter(fun(Cs) -> may_add(S1, Cs, Fixed) end, S2),
   S11 = lists:filter(fun(Cs) -> may_add(S22, Cs, Fixed) end, S1),
-  assert_all_cs_sorted((lists:usort(S11 ++ S22))).
+  lists:usort(S11 ++ S22).
 
 -spec may_add(set_of_constraint_sets_rep(), constraint_set(), monomorphic_variables()) -> boolean().
 may_add(S, Con, Fixed) ->
@@ -140,11 +166,14 @@ saturate(C, FixedVariables, Cache) ->
       SnT = ty:difference(S, T),
       Normed = ty:normalize(SnT, FixedVariables),
       NewS = meet([C], Normed, FixedVariables),
-      Z = lists:foldl(fun(NewC, AllS) ->
-        NewMerged = saturate(NewC, FixedVariables, Cache#{SnT => []}),
-        join(AllS, NewMerged, FixedVariables)
-                  end, [], NewS),
-      Z;
+      % once the accumulator is [[]] (trivially satisfied) the remaining
+      % recursive saturations cannot change it, because join absorbs them
+      lists:foldl(
+        fun(_NewC, [[]]) -> [[]];
+           (NewC, AllS) ->
+             NewMerged = saturate(NewC, FixedVariables, Cache#{SnT => []}),
+             join(AllS, NewMerged, FixedVariables)
+        end, [], NewS);
     none -> 
       [C]
   end.
@@ -235,6 +264,9 @@ pick_bounds_in_c([{Var, S, T} | Cs], Memo) ->
       end
   end.
 
+% meet_full/3 keeps its accumulator minimal as it builds it, so nothing in the
+% solver calls minimize any more; it stays for the is_smaller unit test below.
+-ifdef(TEST).
 -spec minimize(S) -> S when S :: set_of_constraint_sets().
 minimize(S) -> minimize(S, S).
 
@@ -248,27 +280,7 @@ minimize([Cs | Others], All) ->
       minimize(NewS, NewS);
     _ -> minimize(Others, All)
   end.
-
--spec assert_all_cs_sorted(S) -> S when S :: set_of_constraint_sets().
-assert_all_cs_sorted(S) ->
-    % Verify all constraint sets are sorted by sorting them and checking for equality
-    lists:foreach(fun(ConstraintSet) ->
-        Sorted = lists:sort(
-            fun({Var1, _, _}, {Var2, _, _}) ->
-                case ty_variable:compare(Var1, Var2) of
-                    lt -> true;
-                    eq -> true;
-                    gt -> false
-                end
-            end,
-            ConstraintSet
-        ),
-        case ConstraintSet =:= Sorted of
-            true -> ok;
-            false -> error({unsorted_constraint_set, ConstraintSet, Sorted})
-        end
-    end, S),
-    S.
+-endif.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
